@@ -3,32 +3,32 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-  <meta name="theme-color" content="#efe6d2">
-  <meta name="description" content="무협을 처음 만나는 사람을 위한 이야기 중심 텍스트 RPG">
-  <title>강호 첫걸음 — 무협 이야기 RPG · 베타</title>
-  <link rel="preconnect" href="https://fonts.googleapis.com">
-  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-  <link href="https://fonts.googleapis.com/css2?family=Gowun+Batang:wght@400;700&family=Noto+Serif+KR:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+  <meta name="description" content="밥 한 끼와 목검 하나에서 시작되는 완결된 한국어 선택형 무협 RPG. 검보다 먼저 사람을 살피는 당신의 선택이 강호에 이름을 남깁니다.">
+  <meta name="theme-color" content="#193c2d">
+  <title>강호 첫걸음 — 밥 한 끼에서 시작된 인연</title>
+  <link rel="icon" href="assets/seal.svg" type="image/svg+xml">
+  <link rel="preload" href="assets/fonts/GowunBatang-Regular.woff2" as="font" type="font/woff2" crossorigin>
   <link rel="stylesheet" href="style.css?v=8">
   <link rel="stylesheet" href="beta.css?v=1">
+  <link rel="stylesheet" href="release.css?v=1">
 </head>
-<body>
+<body class="booting">
   <div id="worldBackdrop" class="world-backdrop" aria-hidden="true"></div>
   <div class="paper-grain" aria-hidden="true"></div>
-  <header class="topbar">
+  <header class="topbar" inert>
     <a class="brand" href="#" id="brandHome" aria-label="강호 첫걸음 처음으로">
       <span class="brand-stamp">江湖</span>
       <span><strong>강호 첫걸음</strong><small>무림 초보의 모험기</small></span>
     </a>
     <div class="top-actions">
-      <span class="autosave" id="saveStatus"><i></i> 자동 저장</span>
+      <span class="autosave" id="saveStatus" hidden><i></i> 자동 저장</span>
       <button class="icon-button music-button" id="musicToggle" type="button" aria-label="배경 음악 끄기" aria-pressed="true" title="배경 음악 끄기">♫</button>
       <button class="icon-button" data-panel="glossary" aria-label="강호 수첩 열기" title="강호 수첩">?</button>
       <button class="icon-button" id="menuButton" aria-label="메뉴 열기" title="메뉴">☰</button>
     </div>
   </header>
 
-  <main id="app" class="app-shell">
+  <main id="app" class="app-shell" aria-label="강호 첫걸음 이야기">
     <section class="loading-screen"><div class="seal-loader">江</div><p>이야기를 펼치는 중…</p></section>
   </main>
 
@@ -49,6 +49,7 @@
 
   <audio id="mainBgm" src="assets/asianoriental2.ogg" preload="none" loop></audio>
   <div id="toast" class="toast" role="status" aria-live="polite"></div>
-  <script type="module" src="game.js?v=8"></script>
+  <noscript><p class="no-script">이 게임은 JavaScript가 필요합니다. 브라우저에서 JavaScript를 허용하고 다시 열어 주세요.</p></noscript>
+  <script type="module" src="boot.js?v=1.0.0"></script>
 </body>
 </html>

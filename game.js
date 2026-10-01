@@ -1,10 +1,22 @@
-import { events, locationData, locationPositions, npcs, itemData, spritePositions, portraitPositions } from "./events.js?v=3";
+import { events, locationData, npcs, itemData } from "./events.js?v=3";
 
 import { normalizeSave } from "./save-state.js";
+import { readSave, writeSave, BACKUP_KEY, SLOT_KEY } from "./storage.js";
+import { chapterDialogue, endingLetters } from "./narrative.js";
+import { preloadImage, warmScene, warmCharacters } from "./resources.js";
 
 const SAVE_KEY = "jianghu-first-steps-save-v1";
 const MUSIC_KEY = "jianghu-first-steps-music-v1";
 const AUDIO_KEY = "jianghu-first-steps-audio-v1";
+const SETTINGS_KEY = "jianghu-first-steps-settings-v1";
+const QA_MODE = new URLSearchParams(window.location?.search || '').has('qa');
+let preferences = {guide:true, largeText:false, textSpeed:24, reducedMotion:false};
+try { const p=JSON.parse(localStorage.getItem(SETTINGS_KEY)||'{}'); for(const k of ['guide','largeText','reducedMotion'])if(typeof p[k]==='boolean')preferences[k]=p[k];if([0,24,45].includes(p.textSpeed))preferences.textSpeed=p.textSpeed; } catch {}
+const writerId = Date.now().toString(36) + Math.random().toString(36).slice(2);
+let observedSave = null, storageConflict = false, importGeneration = 0;
+try { observedSave=localStorage.getItem(SAVE_KEY); } catch {}
+let typingFrame=null, finishTyping=null, inputAfter=0;
+let lastCombatFocus=null;
 const TERMS = {
   "강호": "무공을 익힌 사람들과 여러 문파, 표국, 장사꾼이 어울려 살아가는 세상.",
   "무공": "몸을 단련해 싸우거나 몸을 지키는 기술. 처음엔 기본 동작부터 배운다.",
@@ -31,8 +43,8 @@ mainBgm.loop = true;
 mainBgm.volume = 0;
 let musicPlaying = false;
 let musicStarting = false;
-let audioSettings = { bgm: 0.28, sfx: 0.62 };
-try { const settings=JSON.parse(localStorage.getItem(AUDIO_KEY)||"{}"); for(const key of ["bgm","sfx"]) if(Number.isFinite(settings[key]))audioSettings[key]=Math.max(0,Math.min(1,settings[key])); } catch {}
+let audioSettings = { master:0.8, bgm: 0.28, sfx: 0.62 };
+try { const settings=JSON.parse(localStorage.getItem(AUDIO_KEY)||"{}"); for(const key of ["master","bgm","sfx"]) if(Number.isFinite(settings[key]))audioSettings[key]=Math.max(0,Math.min(1,settings[key])); } catch {}
 const battleBgm = new Audio("assets/remaster/samurai-battle.mp3");
 const trainingBgm = new Audio("assets/remaster/samurai-final-erhu.mp3");
 const finalBgm = new Audio("assets/remaster/samurai-final-base.mp3");
@@ -41,12 +53,13 @@ battleBgm.preload = trainingBgm.preload = finalBgm.preload = "none";
 let activeCue = null;
 let fadeTimer = null;
 let audioContext = null;
+let effectsBus=null, lastEffectAt=0;
 function activeTracks() { return [mainBgm, battleBgm, trainingBgm, finalBgm]; }
 function crossfadeCue(cue) {
   const target = cue === "battle" ? battleBgm : cue === "training" ? trainingBgm : cue === "final" ? finalBgm : mainBgm;
-  if (activeCue === target && !target.paused && target.volume > 0.001) return;
+  if (activeCue === target && !target.paused) return;
   activeCue = target;
-  if (!musicEnabled) return;
+  if (!musicEnabled || document.hidden) return;
   clearInterval(fadeTimer);
   const tracks = activeTracks();
   if (target.paused) target.volume = 0;
@@ -56,7 +69,7 @@ function crossfadeCue(cue) {
   fadeTimer = setInterval(() => {
     const t = Math.min(1, (performance.now() - began) / duration);
     from.forEach(({track,start}) => {
-      track.volume = Math.max(0, Math.min(1, (track === target ? start + (audioSettings.bgm - start) * t : start * (1-t))));
+      track.volume = Math.max(0, Math.min(1, (track === target ? start + (audioSettings.master*audioSettings.bgm - start) * t : start * (1-t))));
       if (t === 1 && track !== target) track.pause();
     });
     if (t === 1) clearInterval(fadeTimer);
@@ -66,23 +79,25 @@ function crossfadeCue(cue) {
 function setBgmCue(cue) { crossfadeCue(cue); }
 function stopAllMusic() { clearInterval(fadeTimer); activeTracks().forEach((track) => { track.pause(); track.volume = 0; }); musicPlaying = false; }
 function playSfx(name) {
-  if (!audioSettings.sfx) return;
+  if (!audioSettings.sfx || !audioSettings.master || document.hidden) return;
+  const stamp=performance.now();if(name==='click'&&stamp-lastEffectAt<65)return;lastEffectAt=stamp;
   try {
     audioContext ||= new (window.AudioContext || window.webkitAudioContext)();
     if (audioContext.state === "suspended") audioContext.resume();
     const ctx=audioContext, now=ctx.currentTime, gain=ctx.createGain(), osc=ctx.createOscillator();
+    if(!effectsBus){effectsBus=ctx.createDynamicsCompressor();effectsBus.threshold.value=-16;effectsBus.ratio.value=8;effectsBus.connect(ctx.destination);}
     const presets={click:[540,720,.045,"sine"],draw:[260,740,.26,"sawtooth"],slash:[820,180,.19,"triangle"],impact:[115,62,.24,"sawtooth"],block:[430,250,.18,"triangle"],dodge:[300,980,.2,"sine"],skill:[240,920,.42,"sine"],reward:[520,1040,.32,"sine"],victory:[392,784,.75,"triangle"],dialog:[460,520,.07,"sine"]};
     const [a,b,dur,wave]=presets[name]||presets.click;
     osc.type=wave;osc.frequency.setValueAtTime(a,now);osc.frequency.exponentialRampToValueAtTime(Math.max(40,b),now+dur);
-    gain.gain.setValueAtTime(.0001,now);gain.gain.exponentialRampToValueAtTime(Math.max(.002,audioSettings.sfx*.13),now+.012);gain.gain.exponentialRampToValueAtTime(.0001,now+dur);
-    osc.connect(gain);gain.connect(ctx.destination);osc.start(now);osc.stop(now+dur+.01);
+    gain.gain.setValueAtTime(.0001,now);gain.gain.exponentialRampToValueAtTime(Math.max(.002,audioSettings.master*audioSettings.sfx*.13),now+.012);gain.gain.exponentialRampToValueAtTime(.0001,now+dur);
+    osc.connect(gain);gain.connect(effectsBus);osc.start(now);osc.stop(now+dur+.01);osc.onended=()=>{osc.disconnect();gain.disconnect();};
     if(name==="impact"||name==="block"){
       const length=Math.floor(ctx.sampleRate*.12), buffer=ctx.createBuffer(1,length,ctx.sampleRate), data=buffer.getChannelData(0);
       for(let i=0;i<length;i++)data[i]=(Math.random()*2-1)*(1-i/length);
       const hit=ctx.createBufferSource(), filter=ctx.createBiquadFilter(), thump=ctx.createGain();
       hit.buffer=buffer;filter.type="lowpass";filter.frequency.value=name==="block"?900:1350;
-      thump.gain.setValueAtTime(audioSettings.sfx*.28,now);thump.gain.exponentialRampToValueAtTime(.0001,now+.12);
-      hit.connect(filter);filter.connect(thump);thump.connect(ctx.destination);hit.start(now);
+      thump.gain.setValueAtTime(audioSettings.master*audioSettings.sfx*.2,now);thump.gain.exponentialRampToValueAtTime(.0001,now+.12);
+      hit.connect(filter);filter.connect(thump);thump.connect(effectsBus);hit.start(now);hit.onended=()=>{hit.disconnect();filter.disconnect();thump.disconnect();};
     }
   } catch {}
 }
@@ -97,12 +112,12 @@ function syncMusicButton() {
   button.classList.toggle("music-off", !musicEnabled);
 }
 async function startMusic() {
-  if (!musicEnabled || musicStarting || (musicPlaying && activeCue && !activeCue.paused)) return;
+  if (!musicEnabled || document.hidden || musicStarting || (musicPlaying && activeCue && !activeCue.paused)) return;
   musicStarting = true;
   try {
     const target = activeCue || mainBgm;
     activeCue = target;
-    target.volume = audioSettings.bgm;
+    target.volume = audioSettings.master*audioSettings.bgm;
     await target.play();
     musicPlaying = true;
   }
@@ -113,8 +128,12 @@ async function startMusic() {
 function esc(value) {
   return String(value ?? "").replace(/[&<>"']/g, (c) => ({"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#39;"}[c]));
 }
+function instrumental(word) {
+  const last=word.charCodeAt(word.length-1)-0xac00;
+  return word+(last>=0&&last<=11171&&last%28!==0&&last%28!==8?'으로':'로');
+}
 function storedSave() {
-  try { const raw = localStorage.getItem(SAVE_KEY); return raw ? normalizeSave(JSON.parse(raw), makeInitial("나그네")) : null; } catch { return null; }
+  try{return readSave(localStorage,SAVE_KEY,normalizeSave,makeInitial('나그네')) || readSave(localStorage,BACKUP_KEY,normalizeSave,makeInitial('나그네'));}catch{return null;}
 }
 function makeInitial(name) {
   return {
@@ -122,18 +141,26 @@ function makeInitial(name) {
     coin: 0, exp: 0, bonusAtk: 0, bonusDef: 0, gear: {weapon:null,armor:null}, items: {}, skills: [], sect: "아직 정하지 않음",
     mainStage: 0, flags: {}, trust: {}, rumors: 0, clues: [], done: [], lastDay: {}, day: 1,
     discoveredTerms: ["강호","무공","내공"], history: [], activeEventId: null, tutorial: "intro", combat: null,
-    pendingCombatChoice: null, injury: null, guide: true, largeText: false, visited: ["market"],
+    pendingCombatChoice: null, injury: null, guide: preferences.guide, largeText: preferences.largeText, visited: ["market"], dialogueStep:0,
     log: [{title:"낯선 장터", text:"정신을 차리니 낯선 장터였다. 가진 돈은 없고 배는 고프다.", day:1}]
   };
 }
 function save() {
-  if (!state) return;
+  if (!state || storageConflict) return false;
   try {
-    localStorage.setItem(SAVE_KEY, JSON.stringify(state));
+    if(localStorage.getItem(SAVE_KEY)!==observedSave){storageConflict=true;showStorageConflict();return false;}
+    const written=writeSave(localStorage,SAVE_KEY,state,normalizeSave,makeInitial('나그네'),{writer:writerId});
+    observedSave=JSON.stringify(written);state.savedAt=written.savedAt;state.writer=writerId;
     const chip = document.getElementById("saveStatus");
-    if (chip) { chip.classList.add("saved"); setTimeout(() => chip.classList.remove("saved"), 600); }
-  } catch { showToast("저장 공간이 부족합니다. 저장 내보내기를 이용해 주세요."); }
+    if (chip) { chip.innerHTML='<i></i> 저장됨';chip.classList.remove('save-error');chip.classList.add("saved"); }
+    return true;
+  } catch {
+    const chip=document.getElementById('saveStatus');if(chip){chip.innerHTML='<i></i> 저장 안 됨';chip.classList.add('save-error');}
+    showToast("자동 저장에 실패했습니다. 저장 메뉴에서 여정을 백업해 주세요.");return false;
+  }
 }
+function savePreferences(){try{localStorage.setItem(SETTINGS_KEY,JSON.stringify(preferences));}catch{showToast('설정을 보관할 수 없습니다. 현재 실행에는 적용됩니다.');}}
+function showStorageConflict(){showModal(`${panelTitle('다른 창에서 여정이 진행됐습니다','이 창의 자동 저장을 멈췄습니다. 이어갈 기록을 직접 선택해 주세요.')}<div class="save-options"><button class="save-option" data-action="reload-latest"><strong>최신 저장으로 이어 하기</strong><small>다른 창이 저장한 여정 불러오기</small></button><button class="save-option" data-action="export"><strong>이 창의 여정 백업</strong><small>현재 화면의 진행을 파일로 보관</small></button></div>`);}
 function showToast(message) {
   const node = document.getElementById("toast");
   node.textContent = message;
@@ -166,7 +193,7 @@ function itemPrice(id) {
 function stats() {
   const weapon = state?.gear?.weapon ? itemData[state.gear.weapon] : null;
   const armor = state?.gear?.armor ? itemData[state.gear.armor] : null;
-  return { atk: 5 + (weapon?.atk || 0) + state.bonusAtk, def: 1 + (weapon?.def || 0) + (armor?.def || 0) + state.bonusDef };
+  return { atk: 5 + (weapon?.atk || 0) + state.bonusAtk + Math.floor(state.exp/10), def: 1 + (weapon?.def || 0) + (armor?.def || 0) + state.bonusDef };
 }
 function stageName() {
   return ["강호의 첫날","사라진 표물","안개 속 호송","산채의 진실","비급 수련","흰 옷 검객","천하제일 비무","천하제일인"][Math.min(state?.mainStage || 0, 7)];
@@ -197,6 +224,7 @@ function moveTo(id, {force=false, openEvent=null}={}) {
     state.log.unshift({title:`${locationData[id].name}에 도착`,text:`${locationData[id].hint}을 살펴보기로 했다.`,day:state.day});
   }
   state.activeEventId = openEvent;
+  state.dialogueStep=0;
   setBgmCue(state.mainStage>=6&&id==="sect"?"final":id==="sect"&&state.mainStage>=4?"training":"ambient");
   save(); closeModal(); render();
 }
@@ -288,19 +316,21 @@ function renderStart() {
   document.getElementById("app").innerHTML = `
     <section class="welcome" aria-label="강호 첫걸음 게임 시작">
       <div class="welcome-content">
-        <div class="eyebrow">A BEGINNER'S JIANGHU STORY</div>
+        <div class="eyebrow">一飯之恩 · 밥 한 끼에서 시작된 인연</div>
         <h1>강호<br><span>첫걸음</span></h1>
-        <p class="welcome-lead">무협을 처음 만난 당신과 주인공.<br>밥 한 끼에서 시작해 사람을 만나고, 작은 사건을 풀며<br>조금씩 강호인의 길을 걷습니다.</p>
-        <div class="welcome-meta"><span class="tag">선택형 이야기 RPG</span><span class="tag">초보자 안내 포함</span><span class="tag">자동 저장</span></div>
+        <p class="welcome-lead">주머니는 비었고, 손에는 목검 하나.<br>검보다 먼저 사람을 살피는 당신의 선택이<br>강호에 새로운 이름을 남깁니다.</p>
+        <div class="welcome-meta"><span class="tag">선택으로 쓰는 무협</span><span class="tag">세 번의 승부</span><span class="tag">하나의 완결된 여정</span></div>
         <div class="button-row">
-          <button class="btn btn-primary" data-action="new-game">새 여정 시작 <span aria-hidden="true">→</span></button>
-          ${saved?.started ? `<button class="btn btn-quiet" data-action="continue">이어 하기</button>` : ""}
-          <button class="btn btn-quiet" data-panel="about">게임 안내</button>
+          ${saved?.started ? `<button class="btn btn-primary" data-action="continue">이어 하기 <span aria-hidden="true">→</span></button>` : ''}
+          <button class="btn ${saved?'btn-quiet':'btn-primary'}" data-action="new-game">새 여정 시작 ${saved?'':'→'}</button>
         </div>
+        ${saved?`<p class="continue-caption">${esc(saved.name)} · ${esc(locationData[saved.location].name)} · ${saved.day}일째</p>`:''}
+        <div class="title-links"><button data-action="settings">설정</button><button data-action="save-panel">저장 관리</button><button data-panel="about">게임 안내 · 크레딧</button></div>
       </div>
-      <div class="welcome-foot">江湖初行 · THE ROAD BEGINS WITH A MEAL</div>
+      <div class="title-art" aria-hidden="true"><div class="title-moon"></div><span class="title-calligraphy">江<br>湖<br>初<br>行</span><img src="assets/remaster/traveler-standing.webp" alt="" width="1024" height="1536"><span class="title-seal">첫<br>걸음</span></div>
+      <div class="welcome-foot">강호 첫걸음 · 이야기의 끝에서 당신의 선택을 기억합니다</div>
     </section>
-    <p class="subtle" style="text-align:center;font-size:10px;margin-top:12px">진행 상황은 이 브라우저에 자동 저장됩니다.</p>`;
+    <p class="title-note">진행은 이 브라우저에 자동 저장됩니다 · 마우스 또는 키보드로 플레이</p>`;
 }
 function renderSidebar() {
   const st = stats(), weapon = state.gear.weapon ? itemData[state.gear.weapon] : null, armor = state.gear.armor ? itemData[state.gear.armor] : null;
@@ -318,7 +348,7 @@ function renderSidebar() {
       <div class="side-grid"><div class="side-stat"><small>은전 · 가진 돈</small><strong>${state.coin} 냥</strong></div><div class="side-stat"><small>공격 · 방어</small><strong>${st.atk} / ${st.def}</strong></div></div>
       ${weapon ? `<div class="equipped-row">${itemSprite(state.gear.weapon,"mini-sprite")}<div><strong>${esc(weapon.name)}</strong><small>장착 무기 · 공격 +${weapon.atk||0}</small></div></div>` : `<div class="equipped-row"><div class="mini-sprite"></div><div><strong>맨손</strong><small>장착한 무기가 없습니다</small></div></div>`}
       ${armor ? `<div class="equipped-row">${itemSprite(state.gear.armor,"mini-sprite")}<div><strong>${esc(armor.name)}</strong><small>장착 방어구 · 방어 +${armor.def||0}</small></div></div>` : ""}
-      <div class="stat-line"><span>수련 경험</span><span class="stat-number">${state.exp}</span></div><div class="meter exp"><span style="width:${expPct}%"></span></div>
+      <div class="stat-line"><span>수련 ${Math.floor(state.exp/10)+1}단 · 공격 보너스 +${Math.floor(state.exp/10)}</span><span class="stat-number">${state.exp%10} / 10</span></div><div class="meter exp"><span style="width:${expPct}%"></span></div>
     </section>
     <section class="panel goal-card"><span class="goal-label">현재 목표 · ${quest.step}/7</span><h3>${esc(quest.title)}</h3><p>${esc(quest.body)}</p><div class="progress-track">${[0,1,2,3,4,5,6].map((n)=>`<span class="${state.mainStage>n?"done":""}"></span>`).join("")}</div><button class="btn btn-small btn-light" style="margin-top:12px" data-action="quest">목표로 이동 <span aria-hidden="true">→</span></button></section>
     <section class="panel side-shortcuts"><button data-panel="map">지도</button><button data-panel="inventory">가방</button><button data-panel="glossary">수첩</button><button data-panel="people">인물</button></section>
@@ -330,7 +360,7 @@ function renderGameFrame(content, {hero=false}={}) {
   const visited = state.visited.length;
   return `<div class="game-layout ${state.largeText?"large-text":""}"><details class="journey-drawer"><summary><span class="drawer-health">♥ ${state.hp}/${state.maxHp} · 氣 ${state.qi}/${state.maxQi}</span><span class="drawer-goal">${esc(questInfo().title)}</span><span class="drawer-caret">＋</span></summary>${renderSidebar()}</details><section class="main-column">
     <div class="panel location-banner">${art}<div class="location-copy"><div class="location-kicker">CURRENT LOCATION · ${String(loc.image+1).padStart(2,"0")}</div><h2>${esc(loc.name)}</h2><p>${esc(loc.hint)}. ${hero?"처음 만난 이곳에는 낯선 말과 익숙한 밥 냄새가 함께 있다.":"사람들의 표정과 길목을 천천히 살펴본다."}</p><div class="location-meta"><span class="soft-tag">${visited} / 8곳 방문</span><span class="soft-tag">${state.rumors}개의 소문</span><span class="soft-tag">${state.discoveredTerms.length}개 용어 수첩</span></div></div></div>
-    <div class="chapter-strip"><strong>${esc(stageName())}</strong><span class="date-label">${state.day}일째 · 자동 저장 중</span></div>
+    <div class="chapter-strip"><strong>${esc(stageName())}</strong><span class="date-label">${state.day}일째</span></div>
     ${content}
   </section></div>`;
 }
@@ -340,15 +370,27 @@ function eventCard(ev, quest=false) {
 }
 function questEvent() { const q=questInfo(); return q.eid ? events.find((e)=>e.id===q.eid) : null; }
 function renderEventScene(ev) {
+  const beats=chapterDialogue[ev.id];
+  if(beats && (state.dialogueStep||0)<beats.length)return renderChapterDialogue(ev,beats);
   const person = npcRecord(ev.npc);
   const standing = ev.npc === "bandit-master" ? "bandit-standing" : ev.npc === "mentor" ? "mentor-standing" : ev.npc === "midboss" ? "midboss-standing" : ev.npc === "grandmaster" ? "grandmaster-standing" : null;
   const figure = standing ? `<img class="event-standing" src="assets/remaster/${standing}.webp" alt="${esc(person?.name||"강호 사람")} 전신 모습">` : "";
   const intro = `<div class="scene-heading"><div><h2>${esc(ev.title)}</h2><p>${esc(person?.name||"누군가")} · ${esc(person?.role||"강호 사람")}</p></div><span class="scene-badge">${esc(ev.category)}</span></div>
     ${figure?`<div class="event-portrait-stage">${figure}<span>${esc(person?.name||"")}</span></div>`:""}
-    <div class="story-box">${person?`<p><strong>${esc(person.name)}:</strong> ${esc(person.hello)} ${esc(relationshipLine(person))}</p>`:""}<p>${esc(ev.intro)}</p></div>
-    <div class="event-actions">${ev.choices.map((c,i)=>`<button class="choice-button" data-action="choose-event" data-index="${i}"><span class="choice-num">0${i+1}</span><span class="choice-title">${esc(c.label)}</span>${state.guide?`<span class="choice-hint">${esc(c.hint)}</span>`:""}</button>`).join("")}</div>
+    <div class="story-box">${person&&!beats?`<p><strong>${esc(person.name)}:</strong> ${esc(person.hello)} ${esc(relationshipLine(person))}</p>`:""}<p>${esc(ev.intro)}</p></div>
+    <div class="event-actions">${ev.choices.map((c,i)=>`<button class="choice-button" data-action="choose-event" data-index="${i}" ${c.effects.coin<0&&state.coin < -c.effects.coin?"disabled":""}><span class="choice-num">0${i+1}</span><span class="choice-title">${esc(c.label)}</span>${state.guide?`<span class="choice-hint">${esc(c.hint)}</span>`:""}</button>`).join("")}</div>
     <div class="scene-foot"><small>선택에 따라 돈, 체력, 인물의 신뢰와 다음 사건이 달라질 수 있어요.</small><button class="btn btn-small" data-action="leave-event">잠시 뒤에 보기</button></div>`;
   return `<section class="panel scene-card event-scene ${figure?"has-standing":""}">${intro}</section>`;
+}
+function renderChapterDialogue(ev,beats) {
+  const step=Math.min(beats.length-1,state.dialogueStep||0), [speaker,text]=beats[step];
+  const person=npcRecord(ev.npc), figure={mentor:'mentor',midboss:'midboss',grandmaster:'grandmaster','bandit-master':'bandit'}[ev.npc];
+  return `<section class="panel chapter-dialogue"><div class="scene-heading"><div><p>여정 ${questInfo().step} · ${step+1} / ${beats.length}</p><h2>${esc(ev.title)}</h2></div><button class="btn btn-small" data-action="skip-dialogue">선택으로 건너뛰기</button></div><div class="chapter-stage">${figure?`<img class="chapter-figure" src="assets/remaster/${figure}-standing.webp" width="1024" height="1536" alt="${esc(person.name)}">`:portrait(person?.id,'chapter-portrait')}<div class="chapter-stage-caption">${esc(locationData[state.location].name)}<small>${esc(person?.role||'강호의 이야기')}</small></div></div><div class="chapter-speech"><span class="speaker-name">${esc(speaker==='나'?state.name:speaker)}</span><p class="dialogue-text" data-typewriter>${esc(text)}</p><div class="dialogue-footer"><small>한 번 누르면 문장 완성 · 다시 누르면 다음 대사</small><button class="btn btn-primary" data-action="advance-dialogue">${step===beats.length-1?'선택하기':'다음'} →</button></div></div></section>`;
+}
+function advanceDialogue(){
+  if(finishTyping){finishTyping();return;}if(performance.now()<inputAfter)return;
+  const beats=chapterDialogue[state?.activeEventId];if(!beats)return;
+  state.dialogueStep=Math.min(beats.length,(state.dialogueStep||0)+1);inputAfter=performance.now()+160;playSfx('dialog');save();render();
 }
 function areaNarrative(id) {
   const text = {
@@ -368,7 +410,10 @@ function effectSummary(fx={}) {
   const bits=[];
   if(fx.coin)bits.push(`은전 ${fx.coin>0?"+":""}${fx.coin}`);
   if(fx.item)bits.push(`${itemData[fx.item]?.name||"물품"} 획득`);
-  if(fx.learn)bits.push("새 무공 습득");
+  if(fx.learn)bits.push(({sword:"기초 검식",fist:"기초 권법",lightness:"가벼운 발놀림"}[fx.learn]||"새 무공")+" 습득");
+  if(fx.exp)bits.push(`수련 경험 +${fx.exp}`);
+  if(fx.items)Object.entries(fx.items).forEach(([id,n])=>bits.push(`${itemData[id]?.name||id} ×${n}`));
+  if(fx.day)bits.push(`${fx.day}일의 수련`);
   if(fx.atk)bits.push(`공격 +${fx.atk}`);
   if(fx.def)bits.push(`방어 +${fx.def}`);
   if(fx.trust)bits.push("인물 관계 변화");
@@ -387,10 +432,7 @@ function renderFreeScene() {
     if (ev) return renderGameFrame(renderEventScene(ev));
     state.activeEventId = null;
   }
-  if (state.mainStage === 3 && state.location === "inn") {
-    const ending = events.find((e)=>e.id==="story-epilogue");
-    if (ending && availableEvent(ending)) return renderGameFrame(renderEventScene(ending));
-  }
+  // Goal buttons open main scenes with a persistent activeEventId.
   const main = state.mainStage < 7 ? questEvent() : null;
   const candidates = events.filter((ev)=>ev.location===state.location && availableEvent(ev) && ev.id!==main?.id && !["case-ledger","case-courier","case-mountain","story-epilogue"].includes(ev.id));
   const visible = candidates.slice(0,4);
@@ -423,6 +465,7 @@ function combatSpec(id) {
   return {name:"골목의 강도",role:"장터 뒷골목에서 길을 막은 사내",hp:22,damage:5,figure:"bandit-standing",intro:"공격으로 빈틈을 노려라. 방어하면 내공(기술에 쓰는 힘)이 3 회복된다."};
 }
 function startCombat(id) {
+  lastCombatFocus=null;
   const spec = combatSpec(id);
   state.result=null;
   state.encounterStep=null;
@@ -438,7 +481,9 @@ function startCombat(id) {
   playSfx("draw");
   save(); render();
 }
-function scheduleCombat(combat, action, delay) { setTimeout(()=>{if(state?.combat===combat)action();},delay); }
+function scheduleCombat(combat, action, delay) {
+  setTimeout(()=>{if(state?.combat!==combat)return;if(document.hidden||!document.getElementById('modalBackdrop').hidden||storageConflict){scheduleCombat(combat,action,120);return;}action();},delay);
+}
 function battleLog(text) {
   if (!state.combat) return;
   state.combat.logs.push(text);
@@ -446,8 +491,9 @@ function battleLog(text) {
 }
 function renderCombat() {
   const c=state.combat,spec=combatSpec(c.id),st=stats(),playerPct=state.hp/state.maxHp*100,enemyPct=c.enemyHp/c.enemyMax*100;
-  const skillName = state.skills.includes("sword")?"기초 검식":state.skills.includes("fist")?"기초 권법":state.skills.includes("lightness")?"가벼운 발놀림":"기술 없음";
-  const skillPreview=state.skills.length?(state.qi<8?"내공 부족 · 방어로 +3":"내공 8 · 강한 일격"):"수련 후 사용 가능";
+  const style=state.skills.includes(c.style)?c.style:state.skills[0];
+  const skillName={sword:'기초 검식',fist:'기초 권법',lightness:'가벼운 발놀림'}[style]||'기술 없음';
+  const skillPreview=style?(state.qi<8?'내공 부족 · 방어로 +3':{sword:'내공 8 · 피해 +7',fist:'내공 8 · 피해 +5 / 방어',lightness:'내공 8 · 피해 +3 / 회피'}[style]):'수련 후 사용 가능';
   const heavy=isHeavy(c);
   const disabled=c.turnPending?"disabled":"";
   const content=`<section class="combat-shell combat-screen ${c.turnPending?"combat-resolving":""}">
@@ -462,9 +508,10 @@ function renderCombat() {
       ${c.turnPending?`<div class="turn-shade" role="status">공방이 이어집니다…</div>`:""}
     </div>
     <div class="combat-console"><div class="combat-console-head"><div><strong>무엇을 하시겠습니까?</strong><small>한 차례에 하나의 행동을 고르세요.</small></div><span>차례 ${c.round+1}</span></div>
+      ${state.skills.length>1?`<label class="combat-style">사용할 무공 <select data-combat-style aria-label="사용할 무공" ${disabled}>${state.skills.map(s=>`<option value="${s}" ${s===style?'selected':''}>${{sword:'기초 검식',fist:'기초 권법',lightness:'가벼운 발놀림'}[s]}</option>`).join('')}</select></label>`:''}
       <div class="combat-actions">
         <button class="combat-action action-primary" data-action="combat-move" data-move="attack" ${disabled}><span>⚔</span><strong>기본 공격</strong><small>피해 ${st.atk+(c.opening||0)}+</small></button>
-        <button class="combat-action" data-action="combat-move" data-move="defend" ${disabled}><span>◈</span><strong>방어</strong><small>내공 +3 · 피해 감소</small></button>
+        <button class="combat-action ${heavy?'recommended-action':''}" data-action="combat-move" data-move="defend" ${disabled}><span>◈</span><strong>방어</strong><small>내공 +3 · 피해 감소</small></button>
         <button class="combat-action" data-action="combat-move" data-move="dodge" ${disabled||state.qi<2?"disabled":""}><span>〰</span><strong>회피</strong><small>내공 −2 · 반격 +3</small></button>
         <button class="combat-action" data-action="combat-move" data-move="skill" ${disabled||!state.skills.length||state.qi<8?"disabled":""}><span>✦</span><strong>${esc(skillName)}</strong><small>${esc(skillPreview)}</small></button>
         <button class="combat-action" data-action="combat-items" ${disabled}><span>囊</span><strong>회복 물품</strong><small>가방에서 선택</small></button>
@@ -482,7 +529,7 @@ function renderInjury() {
   return renderGameFrame(content);
 }
 function renderReward() {
-  const content=`<section class="panel scene-card"><div class="scene-heading"><div><h2>첫 보상을 고르자</h2><p>장터 소동은 끝났다. 주인장과 사부가 작은 답례를 내놓는다.</p></div><span class="scene-badge">첫 보상</span></div><div class="story-box"><p>잡배는 달아났고, 당신은 무사하다. 주인은 잘 버텼다며 네가 원하는 걸 하나 고르라고 한다.</p><p>무기는 전투에서 힘을 더하고, 무공을 배우면 내공을 써서 강한 기술을 쓸 수 있다.</p></div><div class="reward-grid">
+  const content=`<section class="panel scene-card"><div class="scene-heading"><div><h2>첫 보상을 고르자</h2><p>장터 소동은 끝났다. 주인장과 사부가 작은 답례를 내놓는다.</p></div><span class="scene-badge">첫 보상</span></div><div class="story-box"><p>잡배는 달아났고, 당신은 무사하다. 주인은 잘 버텼다며 네가 원하는 걸 하나 고르라고 한다.</p><p>무기는 전투에서 힘을 더하고, 무공을 배우면 내공을 써서 강한 기술을 쓸 수 있다. 검식은 강한 일격, 권법은 공격과 방어, 발놀림은 공격과 회피를 함께 펼친다.</p></div><div class="reward-grid">
     <button class="reward-option" data-action="reward" data-reward="weapon">${itemSprite("weapon-iron-jian","reward-art")}<strong>무명 철검</strong><small>공격력 +3 · 바로 장착<br>목검보다 한 단계 높은 무기</small></button>
     <button class="reward-option" data-action="reward" data-reward="gauntlet">${itemSprite("weapon-iron-gauntlets","reward-art")}<strong>철권 보호대</strong><small>공격력 +2 · 방어력 +1<br>권법에 어울리는 장비</small></button>
     <button class="reward-option" data-action="reward" data-reward="manual">${itemSprite("weapon-jade-jian","reward-art")}<strong>기초 검식 한 수</strong><small>전투에서 내공 8을 써 강하게 공격</small></button>
@@ -492,40 +539,77 @@ function renderReward() {
 function renderEnding() {
   const path=state.flags.finalApproach==="allies"?"동료의 믿음을 등에 업고":"비급으로 익힌 호흡을 따라";
   const bond=state.trust.bandit>0||state.trust.guard>1?"길 위에서 맺은 인연은 대련장 끝에서도 너를 지켜보았다.":"사부가 가르친 첫 자세와 스스로의 판단을 끝까지 밀고 나갔다.";
-  const content=`<section class="panel scene-card final-ending"><div class="ending-heading"><span>THE NAME OF JIANGHU</span><h2>천하제일인</h2><p>${esc(state.name)} · 새로운 강호의 이름</p></div><div class="ending-stage"><img src="assets/remaster/traveler-standing.webp" alt="천하제일인이 된 ${esc(state.name)}"><div class="ending-seal">天下<br>第一</div></div><div class="story-box ending-copy"><p>구름 위 대련장에 검성이 천천히 검을 거둔다. ${esc(path)} 마지막 초식을 넘어섰다.</p><p>${esc(bond)} 사람들은 저마다 살아갈 길을 찾았고, 강호는 이제 네 이름을 기억한다.</p><p>${state.flags.assisted?"사부의 조언을 빌렸지만 마지막 한 수는 네 손으로 완성했다. ":""}첫날엔 밥값도, 내공도 몰랐다. 그때 골목에서 쥐었던 목검 한 자루가 오늘의 너를 만들었다.</p></div><div class="ending-actions"><button class="btn btn-primary" data-action="log">여정의 기록 보기</button><button class="btn btn-light" data-action="new-game">새로운 여정</button></div><p class="ending-foot">一劍江湖 · 한 자루의 목검으로 시작한 강호행</p></section>`;
+  const content=`<section class="panel scene-card final-ending"><div class="ending-heading"><span>THE NAME OF JIANGHU</span><h2>천하제일인</h2><p>${esc(state.name)} · 새로운 강호의 이름</p></div><div class="ending-stage"><img src="assets/remaster/traveler-standing.webp" alt="천하제일인이 된 ${esc(state.name)}"><div class="ending-seal">天下<br>第一</div></div><div class="story-box ending-copy"><p>구름 위 대련장에 검성이 천천히 검을 거둔다. ${esc(path)} 마지막 초식을 넘어섰다.</p><p>${esc(bond)} 사람들은 저마다 살아갈 길을 찾았고, 강호는 이제 네 이름을 기억한다.</p><p>${state.flags.assisted?"사부의 조언을 빌렸지만 마지막 한 수는 네 손으로 완성했다. ":""}첫날엔 밥값도, 내공도 몰랐다. 그때 골목에서 쥐었던 목검 한 자루가 오늘의 너를 만들었다.</p></div><div class="ending-stats"><span>${state.day}일의 강호행</span><span>${state.done.length}개의 사건 해결</span><span>${state.visited.length}곳 방문</span><span>${state.skills.length}개의 무공</span></div><details class="ending-letters"><summary>강호에서 도착한 편지</summary>${endingLetters(state).map(([name,text])=>`<article><strong>${esc(name)}</strong><p>${esc(text)}</p></article>`).join("")}</details><div class="ending-actions"><button class="btn btn-primary" data-action="log">여정의 기록 보기</button><button class="btn btn-light" data-action="new-game">새로운 여정</button></div><p class="ending-foot">一劍江湖 · 한 자루의 목검으로 시작한 강호행</p></section>`;
   return renderGameFrame(content);
+}
+function startTypewriter(){
+  if(typingFrame!=null)cancelAnimationFrame(typingFrame);typingFrame=null;finishTyping=null;
+  const node=document.querySelector('#app [data-typewriter]');
+  if(!node||!preferences.textSpeed||preferences.reducedMotion||window.matchMedia('(prefers-reduced-motion: reduce)').matches)return;
+  const text=node.textContent,letters=Array.from(text),started=performance.now();
+  node.innerHTML=`<span class="tw-full">${esc(text)}</span><span class="tw-visible" aria-hidden="true"></span>`;
+  const visible=node.querySelector('.tw-visible');
+  finishTyping=()=>{if(typingFrame!=null)cancelAnimationFrame(typingFrame);node.textContent=text;typingFrame=null;finishTyping=null;inputAfter=performance.now()+100;};
+  const tick=()=>{if(!node.isConnected){finishTyping=null;return;}const count=Math.min(letters.length,Math.floor((performance.now()-started)/preferences.textSpeed));visible.textContent=letters.slice(0,count).join('');if(count>=letters.length){finishTyping();return;}typingFrame=requestAnimationFrame(tick);};
+  typingFrame=requestAnimationFrame(tick);
+}
+function stageMarkup(root,markup){
+  const actors=[...root.querySelectorAll('img.standing-figure,img.battle-figure,img.event-standing,img.chapter-figure')];
+  root.innerHTML=markup;
+  for(const next of root.querySelectorAll('img.standing-figure,img.battle-figure,img.event-standing,img.chapter-figure')){
+    const previous=actors.find(img=>img.getAttribute('src')===next.getAttribute('src')&&img.className===next.className);
+    if(previous)next.replaceWith(previous);
+  }
 }
 function render() {
   const root=document.getElementById("app"), nav=document.getElementById("quickNav");
-  const sceneKey=!state?"welcome":state.combat?`combat-${state.combat.id}`:state.injury?`injury-${state.injury}`:state.result?`result-${state.result.title}`:state.activeEventId||`${state.tutorial}-${state.mainStage}-${state.location}-${state.encounterStep??""}`;
-  if(root.dataset.scene!==sceneKey){root.dataset.scene=sceneKey;requestAnimationFrame(()=>{window.scrollTo({top:0,behavior:"instant"});const focus=root.querySelector("h2,.dialogue-text,h1");if(focus){focus.tabIndex=-1;focus.focus({preventScroll:true});}});}
-  document.body.classList.toggle("large-text",Boolean(state?.largeText));
+  const sceneKey=!state?"welcome":state.combat?`combat-${state.combat.id}`:state.injury?`injury-${state.injury}`:state.result?`result-${state.result.title}`:state.activeEventId?`${state.activeEventId}-${state.dialogueStep||0}`:`${state.tutorial}-${state.mainStage}-${state.location}-${state.encounterStep??""}`;
+  const previousScene=root.dataset.scene,changed=previousScene!==sceneKey, active=document.activeElement;
+  if(active?.dataset?.move)lastCombatFocus=active.dataset.move;
+  const focusMove=state?.combat?lastCombatFocus:null;
+  const styleFocus=active?.hasAttribute?.('data-combat-style');
+  const drawerOpen=root.querySelector('.journey-drawer')?.open;
+  root.dataset.scene=sceneKey;
+  document.body.classList.toggle("large-text",preferences.largeText);
+  document.body.classList.toggle('reduce-motion',preferences.reducedMotion);
   document.body.dataset.scene=state?.combat?"combat":state?.tutorial||"welcome";
+  document.getElementById('saveStatus').hidden=!state;
   renderBackdrop();
+  let markup;
   if (!state?.combat && (state?.tutorial === "encounter" || state?.encounterStep != null)) {
     nav.hidden = true;
-    root.innerHTML = renderEncounter();
-    return;
+    markup=renderEncounter();
+  } else if (!state) { renderStart(); }
+  else {
+    nav.hidden=Boolean(state.combat);
+    if (state.tutorial==="intro") markup=renderIntro();
+    else if (state.injury) markup=renderInjury();
+    else if (state.tutorial==="combat" || state.combat) markup=renderCombat();
+    else if (state.tutorial==="reward") markup=renderReward();
+    else if (state.result) markup=renderResult();
+    else if (state.mainStage>=7) markup=renderEnding();
+    else markup=renderFreeScene();
   }
-  if (!state) { renderStart(); return; }
-  nav.hidden=Boolean(state.combat);
-  if (state.tutorial==="intro") root.innerHTML=renderIntro();
-  else if (state.injury) root.innerHTML=renderInjury();
-  else if (state.tutorial==="combat" || state.combat) root.innerHTML=renderCombat();
-  else if (state.tutorial==="reward") root.innerHTML=renderReward();
-  else if (state.result) root.innerHTML=renderResult();
-  else if (state.mainStage>=7) root.innerHTML=renderEnding();
-  else root.innerHTML=renderFreeScene();
+  if(markup)stageMarkup(root,markup);
+  if(drawerOpen&&!changed){const drawer=root.querySelector('.journey-drawer');if(drawer)drawer.open=true;}
+  if(!changed&&document.getElementById('modalBackdrop').hidden){if(styleFocus)root.querySelector('[data-combat-style]')?.focus({preventScroll:true});else if(focusMove)root.querySelector(`[data-move="${focusMove}"]:not(:disabled)`)?.focus({preventScroll:true});}
+  if(changed)requestAnimationFrame(()=>{
+    if(root.dataset.scene!==sceneKey)return;
+    if(!(state?.activeEventId&&previousScene?.startsWith(state.activeEventId+'-'))&&!(state?.tutorial==='encounter'&&previousScene?.startsWith('encounter-')))window.scrollTo({top:0,behavior:'instant'});
+    if(document.getElementById('modalBackdrop').hidden){const focus=root.querySelector('[data-action="advance-dialogue"],[data-action="advance-encounter"],h2,h1');if(focus){if(focus.tagName!=='BUTTON')focus.tabIndex=-1;focus.focus({preventScroll:true});}}
+    startTypewriter();
+  });
 }
 
 function renderBackdrop() {
   const host = document.getElementById("worldBackdrop");
   if (!host) return;
   const locationId = state?.location || "market";
-  const backdropKey=`${locationId}-${state?.mainStage>=6}-${state?.combat?.id}-${window.innerWidth}-${window.innerHeight}`;
-  if(host.dataset.scene===backdropKey)return;host.dataset.scene=backdropKey;
   const portraitMode = window.matchMedia?.("(max-aspect-ratio: 3/4)").matches;
   const isFinal = state?.combat?.id === "final" || (state?.mainStage >= 6 && locationId === "sect");
+  const backdropKey=`${locationId}-${isFinal}-${portraitMode}`;
+  if(host.dataset.scene===backdropKey){const tile=host.querySelector('.world-scene-window');if(tile){const width=Math.max(window.innerWidth,window.innerHeight*2/3);tile.style.width=width+'px';tile.style.height=width*1.5+'px';}return;}
+  host.dataset.scene=backdropKey;
   const sceneArt = isFinal
     ? (portraitMode ? "assets/remaster/final-mobile.webp" : "assets/remaster/final-wide.webp")
     : locationId === "sect"
@@ -536,7 +620,8 @@ function renderBackdrop() {
         ? "assets/market-hero.png"
       : null;
   if (sceneArt) {
-    host.innerHTML = `<div class="world-hero-image" style="background-image:url('${sceneArt}')"></div><div class="world-scrim"></div>`;
+    const apply=()=>{if(host.dataset.scene===backdropKey)host.innerHTML=`<div class="world-hero-image" style="background-image:url('${sceneArt}')"></div><div class="world-scrim"></div>`;};
+    if(typeof Image!=='undefined')preloadImage(sceneArt).then(apply);else apply();
     return;
   }
   const index = locationData[locationId]?.image ?? 0;
@@ -559,14 +644,14 @@ function renderEncounter() {
   return `<section class="encounter-screen" aria-live="polite">
     <div class="cinematic-kicker"><span>ACT I · 북쪽 장터 뒷골목</span><span>${step+1} / ${lines.length}</span></div>
     <div class="encounter-stage">
-      <img class="standing-figure protagonist-figure enter-left" src="assets/remaster/traveler-standing.webp" alt="${esc(state.name)}가 목검을 든 모습">
-      <img class="standing-figure bandit-figure enter-right" src="assets/remaster/bandit-standing.webp" alt="길을 막아선 강도">
+      <img class="standing-figure protagonist-figure ${step===0?"enter-left":""}" src="assets/remaster/traveler-standing.webp" alt="목검을 든 ${esc(state.name)}">
+      <img class="standing-figure bandit-figure ${step===0?"enter-right":""}" src="assets/remaster/bandit-standing.webp" alt="길을 막아선 강도">
       <span class="scene-caption">장터의 불빛이 골목 끝으로 멀어진다</span>
       ${step===1||step===4?`<div class="speech-burst">${step===1?"흥":"!"}</div>`:""}
     </div>
     <div class="dialogue-panel encounter-dialogue">
       <div class="speaker-name">${esc(line.speaker)}</div>
-      <p class="dialogue-text">${esc(line.text)}</p>
+      <p class="dialogue-text" data-typewriter>${esc(line.text)}</p>
       <button class="btn btn-primary dialogue-advance" data-action="advance-encounter">${step===lines.length-1?"전투 시작":"다음"} <span aria-hidden="true">→</span></button>
     </div>
   </section>`;
@@ -595,6 +680,7 @@ function openingChoice(index) {
 }
 function advanceEncounter() {
   if(state.tutorial!=="encounter")return;
+  if(finishTyping){finishTyping();return;}if(performance.now()<inputAfter)return;inputAfter=performance.now()+160;
   const last=4;
   if(Number(state.encounterStep)<last) { state.encounterStep=Number(state.encounterStep)+1; playSfx("dialog"); save(); render(); return; }
   state.encounterStep=null;
@@ -665,17 +751,19 @@ function combatMove(move) {
   if(move==="flee") { loseCombat("전투에서 물러나 몸을 추슬렀다. 다시 도전하거나 도움을 받을 수 있다."); return; }
   if(move==="attack") {
     const damage=st.atk + (c.round%2===0?1:0)+(c.opening||0); c.opening=0;
-    c.pendingDamage=damage; c.feedback=`${state.gear.weapon?itemData[state.gear.weapon].name:"주먹"}으로 빈틈을 파고들었다!`; battleLog(c.feedback);playSfx("slash");
+    c.pendingDamage=damage; c.feedback=`${instrumental(state.gear.weapon?itemData[state.gear.weapon].name:"주먹")} 빈틈을 파고들었다!`; battleLog(c.feedback);playSfx("slash");
   } else if(move==="defend") {
     c.guard=true; state.qi=Math.min(state.maxQi,state.qi+3); c.feedback="자세를 낮춰 공격을 받아낼 준비를 했다. 내공 +3."; battleLog(c.feedback);
   } else if(move==="dodge") {
     if(state.qi<2)return; state.qi-=2; c.opening=3; c.evade=true;c.feedback="상대의 눈과 어깨를 살피며 옆으로 몸을 낮췄다.";battleLog(c.feedback);playSfx("dodge");
   } else if(move==="skill") {
     if(!state.skills.length||state.qi<8)return;
-    state.qi-=8; const damage=st.atk+7+(c.opening||0); c.opening=0;
+    const style=state.skills.includes(c.style)?c.style:state.skills[0];
+    state.qi-=8; const damage=st.atk+({sword:7,fist:5,lightness:3}[style]||7)+(c.opening||0); c.opening=0;
+    if(style==='fist')c.guard=true;if(style==='lightness')c.evade=true;
     c.pendingDamage=damage;
-    const style=state.skills.includes("sword")?"기초 검식으로 검끝을 비껴쳤다":state.skills.includes("fist")?"기초 권법으로 빈틈을 찔렀다":"가벼운 발놀림으로 뒤를 잡았다";
-    c.feedback=`${style}!`;battleLog(c.feedback);playSfx("skill");
+    const description={sword:'기초 검식으로 검끝을 비껴쳤다',fist:'기초 권법으로 빈틈을 찌르고 자세를 지켰다',lightness:'가벼운 발놀림으로 뒤를 잡아 반격을 피한다'}[style];
+    c.feedback=`${description}!`;battleLog(c.feedback);playSfx("skill");
   } else return;
   c.turnPending=true;c.resolveTimer=true;
   c.lastMove=move;
@@ -719,6 +807,8 @@ function chooseReward(type) {
 
 let modalReturnFocus=null;
 function showModal(html) {
+  finishTyping?.();
+  const modalFocus=document.activeElement?.dataset?.action;
   if(document.getElementById("modalBackdrop").hidden)modalReturnFocus=document.activeElement;
   document.getElementById("modalContent").innerHTML=html;
   document.getElementById("modalBackdrop").hidden=false;
@@ -727,16 +817,17 @@ function showModal(html) {
   document.getElementById("app").inert=true;
   document.querySelector(".topbar").inert=true;
   document.getElementById("quickNav").inert=true;
-  document.getElementById("modalClose").focus();
+  document.body.classList.add('modal-open');
+  (modalFocus&&document.getElementById('modalContent').querySelector(`[data-action="${modalFocus}"]`)||document.getElementById("modalClose")).focus();
 }
-function closeModal() { document.getElementById("app").inert=false;document.querySelector(".topbar").inert=false;document.getElementById("quickNav").inert=false;if(modalReturnFocus?.isConnected)modalReturnFocus.focus(); document.getElementById("modalBackdrop").hidden=true; document.getElementById("modal").classList.remove("developer-tools-modal"); }
+function closeModal() { const wasOpen=!document.getElementById('modalBackdrop').hidden;document.getElementById("modalBackdrop").hidden=true;document.body.classList.remove('modal-open');document.getElementById("app").inert=false;document.querySelector(".topbar").inert=false;document.getElementById("quickNav").inert=false;if(wasOpen){if(modalReturnFocus?.isConnected)modalReturnFocus.focus({preventScroll:true});else document.getElementById('menuButton').focus();}document.getElementById("modal").classList.remove("developer-tools-modal"); }
 function panelTitle(title,subtitle="") { return `<h2 class="modal-title">${title}</h2>${subtitle?`<p class="modal-subtitle">${subtitle}</p>`:""}`; }
 function showMap() {
   const tiles=Object.entries(locationData).map(([id,loc])=>{
     const unlocked=isLocationOpen(id),col=loc.image%4,row=Math.floor(loc.image/4);
     return `<button class="map-place" data-action="travel" data-location="${id}" ${unlocked?"":"disabled"}>${locSprite(id,"map-thumb")}<span><strong>${esc(loc.name)}</strong><small>${esc(loc.hint)}</small>${unlocked?"":`<small class="map-lock">여정 ${loc.stage}단계에서 열림</small>`}</span></button>`;
   }).join("");
-  showModal(`${panelTitle("강호 지도","방문할 곳을 고르세요. 잠긴 곳은 메인 사건을 진행하면 열립니다.")}<div class="map-grid">${tiles}</div><div class="modal-rule"></div><p class="subtle" style="font-size:10px">현재 ${state.visited.length}곳 방문 · 이동하면 하루가 지납니다.</p>`);
+  showModal(`${panelTitle("강호 지도","방문할 곳을 고르세요. 잠긴 곳은 메인 사건을 진행하면 열립니다.")}<div class="map-grid">${tiles}</div><div class="modal-rule"></div><p class="subtle">현재 ${state.visited.length}곳 방문 · 이동하면 하루가 지납니다.</p>`);
 }
 function showInventory() {
   const owned=Object.entries(state.items).filter(([,count])=>count>0);
@@ -751,7 +842,7 @@ function showInventory() {
 }
 function showGlossary() {
   const entries=state?state.discoveredTerms:Object.keys(TERMS).slice(0,3);
-  showModal(`${panelTitle("강호 수첩","실제로 만난 말부터 기록됩니다. 뜻을 외우지 않아도 이야기를 진행할 수 있어요.")}<div class="glossary-list">${entries.map(term=>`<article class="glossary-entry"><strong>${esc(term)}</strong><p>${esc(TERMS[term])}</p></article>`).join("")}</div><div class="modal-rule"></div><p class="subtle" style="font-size:10px">발견한 용어 ${entries.length} / ${Object.keys(TERMS).length}</p>`);
+  showModal(`${panelTitle("강호 수첩","실제로 만난 말부터 기록됩니다. 뜻을 외우지 않아도 이야기를 진행할 수 있어요.")}<div class="glossary-list">${entries.map(term=>`<article class="glossary-entry"><strong>${esc(term)}</strong><p>${esc(TERMS[term])}</p></article>`).join("")}</div><div class="modal-rule"></div><p class="subtle">발견한 용어 ${entries.length} / ${Object.keys(TERMS).length}</p>`);
 }
 function showPeople() {
   showModal(`${panelTitle("강호의 인물", "관계는 선택을 통해 달라집니다. 기억해 둔 이야기는 이후 대사에 반영됩니다.")}<div class="npc-list">${npcs.map(p=>`<article class="npc-card">${portrait(p.id)}<div><strong>${esc(p.name)}</strong><small>${esc(p.role)}</small><p>${esc(p.hello)}</p><small class="${trustOf(p.id)>0?"good":trustOf(p.id)<0?"bad":""}">관계 기록 ${trustOf(p.id)>0?`+${trustOf(p.id)}`:trustOf(p.id)}</small></div></article>`).join("")}</div>`);
@@ -766,33 +857,61 @@ function showShop() {
   showModal(`${panelTitle("장터의 물건",`장사꾼과 객잔에서 살 수 있습니다. 가진 돈: ${state.coin}냥`)}<div class="shop-tabs"><button data-action="shop-filter" data-filter="all" class="${shopFilter==="all"?"active":""}">모두</button><button data-action="shop-filter" data-filter="weapon" class="${shopFilter==="weapon"?"active":""}">무기·방어구</button><button data-action="shop-filter" data-filter="medicine" class="${shopFilter==="medicine"?"active":""}">영약</button></div><div class="inventory-list">${list}</div>`);
 }
 function exportSave() {
-  showModal(`${panelTitle("여정 백업", "저장 파일을 내려받아 다른 브라우저의 ‘저장 파일 가져오기’에서 열 수 있습니다.")}<button class="btn btn-primary" data-action="download-save">백업 파일 다운로드</button><details class="backup-text"><summary>다운로드가 안 되면 저장 내용 직접 복사</summary><p>아래 내용을 복사해 .json 파일로 보관해 주세요.</p><textarea id="saveBackup" aria-label="저장 데이터" readonly>${esc(JSON.stringify(state,null,2))}</textarea><button class="btn btn-small" data-action="select-backup">저장 내용 전체 선택</button></details>`);
+  exportData=JSON.parse(JSON.stringify(state||storedSave()));if(!exportData)return;
+  showModal(`${panelTitle("여정 백업", "저장 파일을 내려받아 다른 브라우저의 ‘저장 파일 가져오기’에서 열 수 있습니다.")}<button class="btn btn-primary" data-action="download-save">백업 파일 다운로드</button><details class="backup-text"><summary>다운로드가 안 되면 저장 내용 직접 복사</summary><p>아래 내용을 복사해 .json 파일로 보관해 주세요.</p><textarea id="saveBackup" aria-label="저장 데이터" readonly>${esc(JSON.stringify(exportData,null,2))}</textarea><button class="btn btn-small" data-action="select-backup">저장 내용 전체 선택</button></details>`);
 }
 function downloadSave() {
-  const blob=new Blob([JSON.stringify(state,null,2)],{type:"application/json"});
+  const blob=new Blob([JSON.stringify(exportData,null,2)],{type:"application/json"});
   const link=document.createElement("a"),url=URL.createObjectURL(blob);
   link.href=url;link.download=`gangho-save-${new Date().toISOString().slice(0,10)}.json`;
   document.body.append(link);link.click();link.remove();setTimeout(()=>URL.revokeObjectURL(url),10000);
   showToast("다운로드를 요청했습니다. 브라우저의 다운로드 목록을 확인해 주세요.");
 }
+function formatSave(record){return record ? esc(record.name)+' · '+esc(locationData[record.location].name)+' · '+record.day+'일째'+(record.savedAt?' · '+new Date(record.savedAt).toLocaleString('ko-KR',{month:'numeric',day:'numeric',hour:'2-digit',minute:'2-digit',timeZone:'Asia/Seoul'}):'') : '비어 있는 기록';}
+function slotRecord(key){try{return readSave(localStorage,key,normalizeSave,makeInitial('나그네'));}catch{return null;}}
 function showSavePanel() {
-  showModal(`${panelTitle("저장과 이어 하기","이 브라우저에는 자동 저장됩니다. 백업 파일을 내려받거나 가져올 수도 있습니다.")}<div class="save-options"><button class="save-option" data-action="manual-save"><strong>지금 수동 저장</strong><small>현재 위치, 가방, 사건 진행, 인물 관계를 이 브라우저에 저장</small></button><button class="save-option" data-action="export"><strong>저장 파일 내보내기</strong><small>다른 브라우저로 옮길 수 있는 JSON 백업 파일 내려받기</small></button><button class="save-option" data-action="import-prompt"><strong>저장 파일 가져오기</strong><small>이전에 내보낸 JSON 파일을 불러오기</small></button><button class="save-option" data-action="log"><strong>여정 기록 보기</strong><small>선택과 사건의 결과를 시간순으로 확인</small></button></div><input type="file" id="importFile" accept=".json,application/json" hidden><div class="modal-rule"></div><button class="btn btn-small" data-action="settings">안내 설정</button> <button class="btn btn-small" data-action="new-game">새 여정 시작</button>`);
+  const auto=storedSave(), previous=slotRecord(BACKUP_KEY), departure=slotRecord(SLOT_KEY+'departure'), beforeLoad=slotRecord(SLOT_KEY+'before-load');
+  showModal(`${panelTitle('여정 보관함','자동 저장과 별개로 세 개의 기록을 보관할 수 있습니다. 불러오기 전 현재 여정을 백업할 수 있어요.')}<div class="save-slot auto-slot"><div><strong>자동 저장</strong><small>${formatSave(auto)}</small></div>${auto?'<button class="btn btn-small" data-load-key="'+SAVE_KEY+'">불러오기</button>':''}</div><div class="save-slots">${[1,2,3].map(n=>{const record=slotRecord(SLOT_KEY+n);return `<article class="save-slot"><div><strong>기록 ${n}</strong><small>${formatSave(record)}</small></div><div class="button-row">${state?`<button class="btn btn-small" data-slot-save="${n}">${record?'덮어쓰기':'저장'}</button>`:''}${record?`<button class="btn btn-small" data-load-key="${SLOT_KEY+n}">불러오기</button>`:''}</div></article>`}).join('')}</div><details class="recovery-records"><summary>이전 여정 복구</summary>${previous?`<button class="save-option" data-load-key="${BACKUP_KEY}"><strong>직전 자동 저장</strong><small>${formatSave(previous)}</small></button>`:''}${departure?`<button class="save-option" data-load-key="${SLOT_KEY+'departure'}"><strong>새 여정 시작 전 기록</strong><small>${formatSave(departure)}</small></button>`:''}${beforeLoad?`<button class="save-option" data-load-key="${SLOT_KEY+'before-load'}"><strong>불러오기 전 기록</strong><small>${formatSave(beforeLoad)}</small></button>`:''}${!previous&&!departure&&!beforeLoad?'<p>복구할 기록이 없습니다.</p>':''}</details><div class="save-options">${state?'<button class="save-option" data-action="manual-save"><strong>지금 자동 저장</strong><small>현재 여정 보관</small></button>':''}${state||auto?'<button class="save-option" data-action="export"><strong>백업 파일 내보내기</strong><small>다른 브라우저로 옮길 JSON</small></button>':''}<button class="save-option" data-action="import-prompt"><strong>저장 파일 가져오기</strong><small>이전 버전의 기록도 불러올 수 있어요</small></button>${state?'<button class="save-option" data-action="log"><strong>여정 기록</strong><small>선택과 사건을 돌아보기</small></button>':''}</div><input type="file" id="importFile" accept=".json,application/json" hidden>`);
+}
+let pendingLoad=null, exportData=null;
+function confirmLoad() {
+  if(!pendingLoad)return;
+  if(state)try{writeSave(localStorage,SLOT_KEY+'before-load',state,normalizeSave,makeInitial('나그네'));}
+  catch{showToast('현재 여정을 보관하지 못했습니다. 파일로 백업한 뒤 다시 불러와 주세요.');return;}
+  const data=pendingLoad;pendingLoad=null;resumeGame(data);if(save())showToast('여정을 불러왔습니다.');
+}
+function reviewLoad(record){
+  if(!record){showToast('읽을 수 없는 기록입니다. 다른 기록이나 백업 파일을 선택해 주세요.');return;}
+  pendingLoad=record;
+  showModal(`${panelTitle('이 여정으로 이어갈까요?',formatSave(record))}<div class="story-box"><p>불러오면 자동 저장이 이 기록으로 바뀝니다. 현재 플레이는 불러오기 직전 복구 기록에 보관됩니다.</p></div><div class="button-row" style="margin-top:20px"><button class="btn btn-primary" data-action="confirm-load">이 여정 불러오기</button><button class="btn" data-action="save-panel">돌아가기</button></div>`);
+}
+function resumeGame(data){
+  importGeneration++;state=data;state.guide=preferences.guide;state.largeText=preferences.largeText;
+  storageConflict=false;try{observedSave=localStorage.getItem(SAVE_KEY);}catch{}
+  activeCue=null;setBgmCue(state.combat?.id==='final'?'final':state.combat?'battle':state.mainStage>=7?'training':state.location==='sect'&&state.mainStage>=4?'training':'ambient');
+  closeModal();render();
+}
+function saveSlot(n,confirmed=false){
+  if(!state||![1,2,3].includes(n))return;
+  if(slotRecord(SLOT_KEY+n)&&!confirmed){showModal(`${panelTitle('기록 '+n+'을 덮어쓸까요?',formatSave(slotRecord(SLOT_KEY+n)))}<p>현재 여정을 이 자리에 보관합니다.</p><div class="button-row"><button class="btn btn-primary" data-confirm-slot="${n}">현재 여정 저장</button><button class="btn" data-action="save-panel">돌아가기</button></div>`);return;}
+  try{writeSave(localStorage,SLOT_KEY+n,state,normalizeSave,makeInitial('나그네'));showSavePanel();showToast('기록 '+n+'에 여정을 보관했습니다.');}catch{showToast('기록을 저장하지 못했습니다. 파일 내보내기를 이용해 주세요.');}
 }
 function showLog() {
   showModal(`${panelTitle("여정 기록", "최근에 일어난 선택과 결과입니다.")}<div class="log-list">${state.log.map(item=>`<article class="log-entry"><small>${item.day}일째 · ${esc(item.title)}</small><p>${esc(item.text)}</p></article>`).join("")}</div>`);
 }
 function showSettings() {
-  showModal(`${panelTitle("게임 안내 설정", "도움말, 읽기 크기, 음악과 효과음을 따로 조절할 수 있습니다.")}<div class="settings-row"><span><strong>선택지 도움말</strong><br><small class="subtle">버튼에 예상 결과를 표시합니다.</small></span><button class="switch ${state.guide?"on":""}" data-action="toggle-guide" aria-label="선택지 도움말 ${state.guide?"켜짐":"꺼짐"}"><span></span></button></div><div class="settings-row"><span><strong>큰 글씨</strong><br><small class="subtle">이야기와 선택지를 크게 표시합니다.</small></span><button class="switch ${state.largeText?"on":""}" data-action="toggle-text" aria-label="큰 글씨 ${state.largeText?"켜짐":"꺼짐"}"><span></span></button></div><label class="audio-slider"><span>배경 음악 <b>${Math.round(audioSettings.bgm*100)}%</b></span><input type="range" min="0" max="100" value="${Math.round(audioSettings.bgm*100)}" data-audio="bgm" aria-label="배경 음악 음량"></label><label class="audio-slider"><span>효과음 <b>${Math.round(audioSettings.sfx*100)}%</b></span><input type="range" min="0" max="100" value="${Math.round(audioSettings.sfx*100)}" data-audio="sfx" aria-label="효과음 음량"></label><div class="modal-rule"></div><p class="subtle" style="font-size:10px;line-height:1.7">음악 재생은 상단의 음표 버튼으로 언제든 끌 수 있습니다. 배경 음악과 효과음 설정은 이 브라우저에 저장됩니다.</p>`);
+  const speed=preferences.textSpeed;
+  showModal(`${panelTitle('설정', '읽기와 소리를 편안한 속도로 맞추세요. 설정은 새 여정에도 유지됩니다.')}<div class="settings-row"><span><strong>선택지 도움말</strong><br><small>행동의 예상 결과 표시</small></span><button class="switch ${preferences.guide?'on':''}" data-action="toggle-guide" role="switch" aria-checked="${preferences.guide}" aria-label="선택지 도움말"><span></span></button></div><div class="settings-row"><span><strong>큰 글씨</strong><br><small>본문과 선택지 확대</small></span><button class="switch ${preferences.largeText?'on':''}" data-action="toggle-text" role="switch" aria-checked="${preferences.largeText}" aria-label="큰 글씨"><span></span></button></div><div class="settings-row"><span><strong>움직임 줄이기</strong><br><small>화면 전환과 전투 애니메이션 감소</small></span><button class="switch ${preferences.reducedMotion?'on':''}" data-action="toggle-motion" role="switch" aria-checked="${preferences.reducedMotion}" aria-label="움직임 줄이기"><span></span></button></div><label class="reading-speed"><strong>대사 표시 속도</strong><select data-setting="textSpeed" aria-label="대사 표시 속도"><option value="24" ${speed===24?'selected':''}>보통</option><option value="45" ${speed===45?'selected':''}>느리게</option><option value="0" ${speed===0?'selected':''}>바로 표시</option></select></label>${[['master','전체 음량'],['bgm','배경 음악'],['sfx','효과음']].map(([key,label])=>`<label class="audio-slider"><span>${label} <b>${Math.round(audioSettings[key]*100)}%</b></span><input type="range" min="0" max="100" value="${Math.round(audioSettings[key]*100)}" data-audio="${key}" aria-label="${label}"></label>`).join('')}<div class="button-row"><button class="btn btn-small" data-action="test-sound">효과음 들어 보기</button><button class="btn btn-small" data-action="fullscreen">전체 화면 전환</button></div><p class="settings-help">대사: Enter / Space · 전투: 숫자 1–6 · 메뉴 닫기: Esc<br>탭을 벗어나거나 메뉴를 열면 전투의 진행이 잠시 멈춥니다.</p>`);
 }
 function showAbout() {
   showModal(`${panelTitle("게임 안내", "낯선 말은 처음 나올 때만 쉽게 설명합니다.")}<div class="glossary-list"><article class="glossary-entry"><strong>무엇을 하면 되나요?</strong><p>장소를 둘러보고 사건을 고른 뒤, 두세 가지 행동 중 하나를 선택합니다. 선택에 따라 돈, 체력, 인물의 신뢰가 달라질 수 있습니다.</p></article><article class="glossary-entry"><strong>전투가 걱정돼요.</strong><p>공격은 피해를 주고, 방어는 다음 피해를 줄이며, 회피는 내공 2를 쓰고 다음 공격에 힘을 더합니다. 패배해도 치료와 재도전이 가능합니다.</p></article><article class="glossary-entry"><strong>저장은 어디에 되나요?</strong><p>진행 상태는 현재 브라우저에 자동 저장됩니다. 저장 메뉴에서 백업 파일로 내보내거나 다시 불러올 수 있습니다.</p></article><article class="glossary-entry"><strong>무협 단어가 어려워요.</strong><p>상단의 물음표 또는 아래 수첩 버튼을 눌러 이미 만난 용어를 언제든 확인하세요.</p></article><article class="glossary-entry"><strong>음악 크레딧</strong><p>Asianoriental2 — Tozan (CC0). Samurai Nights — Majadroid / Maik Hoffmann (CC-BY 4.0). 원곡의 전투·Qin·ErHu 레이어를 편집해 사용했습니다. <a href="CREDITS.md" target="_blank" rel="noopener">출처와 라이선스</a></p></article></div>`);
 }
 function showMenu() {
   if(!state) {
-    showModal(`${panelTitle("게임 메뉴", "게임을 시작하거나 화면 샘플을 확인하세요.")}<div class="save-options"><button class="save-option" data-action="new-game"><strong>새 여정 시작</strong><small>이름을 정하고 강호에 들어갑니다.</small></button><button class="save-option" data-action="developer-tools"><strong>개발자용 툴</strong><small>게임 기능별 샘플 화면 미리보기 · 실제 여정은 변경되지 않음</small></button><button class="save-option" data-panel="about"><strong>게임 안내</strong><small>기본 진행과 저장 방법을 확인합니다.</small></button></div>`);
+    showModal(`${panelTitle("게임 메뉴", "게임을 시작하거나 화면 샘플을 확인하세요.")}<div class="save-options"><button class="save-option" data-action="new-game"><strong>새 여정 시작</strong><small>이름을 정하고 강호에 들어갑니다.</small></button>${QA_MODE?`<button class="save-option" data-action="developer-tools"><strong>화면 검수 도구</strong><small>여정에 영향을 주지 않는 화면 미리보기</small></button>`:""}<button class="save-option" data-panel="about"><strong>게임 안내</strong><small>기본 진행과 저장 방법을 확인합니다.</small></button></div>`);
     return;
   }
-  showModal(`${panelTitle("여정 메뉴", "계속 플레이하거나 기록을 확인하세요.")}<div class="save-options"><button class="save-option" data-action="return"><strong>이야기로 돌아가기</strong><small>현재 장면에서 계속 플레이</small></button><button class="save-option" data-panel="map"><strong>지도</strong><small>방문 가능한 장소 확인</small></button><button class="save-option" data-action="log"><strong>여정 기록</strong><small>지금까지의 사건과 선택</small></button><button class="save-option" data-action="save-panel"><strong>저장 관리</strong><small>수동 저장·내보내기·가져오기</small></button><button class="save-option" data-action="settings"><strong>도움말 설정</strong><small>선택 안내와 큰 글씨</small></button><button class="save-option" data-action="developer-tools"><strong>개발자용 툴</strong><small>게임 기능별 샘플 화면 미리보기 · 실제 여정은 변경되지 않음</small></button><button class="save-option" data-action="new-game"><strong>새 여정 시작</strong><small>다른 이름으로 처음부터 다시 플레이</small></button><button class="save-option" data-panel="about"><strong>게임 안내 · 크레딧</strong><small>조작과 음악 출처</small></button></div>`);
+  showModal(`${panelTitle("여정 메뉴", "계속 플레이하거나 기록을 확인하세요.")}<div class="save-options"><button class="save-option" data-action="return"><strong>이야기로 돌아가기</strong><small>현재 장면에서 계속 플레이</small></button><button class="save-option" data-panel="map"><strong>지도</strong><small>방문 가능한 장소 확인</small></button><button class="save-option" data-action="log"><strong>여정 기록</strong><small>지금까지의 사건과 선택</small></button><button class="save-option" data-action="save-panel"><strong>저장 관리</strong><small>수동 저장·내보내기·가져오기</small></button><button class="save-option" data-action="settings"><strong>설정</strong><small>읽기·움직임·소리·전체 화면</small></button>${QA_MODE?`<button class="save-option" data-action="developer-tools"><strong>화면 검수 도구</strong><small>여정에 영향을 주지 않는 화면 미리보기</small></button>`:""}<button class="save-option" data-action="title"><strong>타이틀로 돌아가기</strong><small>현재 여정을 저장하고 처음 화면으로</small></button><button class="save-option" data-panel="about"><strong>게임 안내 · 크레딧</strong><small>조작과 음악 출처</small></button></div>`);
 }
 
 const developerPreviews = [
@@ -879,7 +998,7 @@ function useItem(id, inCombat=false) {
   state.items[id]-=1;
   state.hp=Math.min(state.maxHp,state.hp+(item.hp||0));state.qi=Math.min(state.maxQi,state.qi+(item.qi||0));
   addLog(`${item.name} 사용`,item.desc);
-  if(inCombat){closeModal();const c=state.combat;if(c){c.feedback=`${item.name}을 사용해 몸을 추슬렀다.`;c.turnPending=true;c.resolveTimer=true;battleLog(c.feedback);}save();render();scheduleCombat(c,resolvePendingStrike,420);return;}
+  if(inCombat){closeModal();const c=state.combat;if(c){c.feedback=`${item.name}을 사용해 몸을 추슬렀다.`;c.lastMove="item";c.turnPending=true;c.resolveTimer=true;battleLog(c.feedback);}save();render();scheduleCombat(c,resolvePendingStrike,420);return;}
   save();showToast(`${item.name}을 사용했습니다.`);showInventory();
 }
 function equipItem(id) {
@@ -900,11 +1019,14 @@ function restAtInn() {
   state.hp=state.maxHp;state.qi=state.maxQi;state.day+=1;addLog("객잔에서 쉬다","따뜻한 밥을 먹고 잠들었다. 체력과 내공이 모두 회복됐다.");save();showToast("푹 쉬었습니다. 체력과 내공이 회복됐어요.");render();
 }
 function newGame() {
-  showModal(`${panelTitle("이름을 정해 주세요", state?"새 여정을 시작하면 현재 자동 저장을 덮어씁니다. 필요한 기록은 저장 메뉴에서 먼저 내보내 주세요.":"이름은 게임 안에서만 사용됩니다. 기본 이름으로 시작해도 괜찮아요.")}<form id="newGameForm"><label for="heroName" class="modal-subtitle">강호에서 불릴 이름</label><input id="heroName" maxlength="12" autocomplete="off" placeholder="나그네" style="width:100%;padding:12px;border:1px solid #ccb995;background:#fffdf6;color:#29372f"><div class="button-row" style="margin-top:14px"><button class="btn btn-primary" type="submit">이 이름으로 시작</button><button class="btn" type="button" data-action="start-default">이름 없이 시작</button></div></form>`);
+  showModal(`${panelTitle("이름을 정해 주세요", (state||storedSave())?"새 여정을 시작하면 이전 여정은 복구 기록에 보관됩니다. 중요한 기록은 저장 관리에서 파일로도 백업해 주세요.":"이름은 게임 안에서만 사용됩니다. 기본 이름으로 시작해도 괜찮아요.")}<form id="newGameForm"><label for="heroName" class="modal-subtitle">강호에서 불릴 이름</label><input id="heroName" maxlength="12" autocomplete="off" placeholder="나그네" style="width:100%;padding:12px;border:1px solid #ccb995;background:#fffdf6;color:#29372f"><div class="button-row" style="margin-top:14px"><button class="btn btn-primary" type="submit">이 이름으로 시작</button><button class="btn" type="button" data-action="start-default">이름 없이 시작</button></div></form>`);
   setTimeout(()=>document.getElementById("heroName")?.focus(),0);
 }
 function beginGame(name) {
-  state=makeInitial(name.trim()||"나그네");closeModal();save();render();
+  importGeneration++;const old=state||storedSave();
+  if(old)try{writeSave(localStorage,SLOT_KEY+'departure',old,normalizeSave,makeInitial('나그네'));}catch{showToast('이전 여정을 복구 기록으로 보관하지 못했습니다. 파일로 먼저 백업해 주세요.');return;}
+  storageConflict=false;try{observedSave=localStorage.getItem(SAVE_KEY);}catch{}
+  state=makeInitial(name.trim().slice(0,12)||'나그네');setBgmCue('ambient');closeModal();save();render();
 }
 function setQuestTarget() {
   if(state.combat||state.injury||state.tutorial!=="free")return;
@@ -913,28 +1035,20 @@ function setQuestTarget() {
   if(q.eid) moveTo(q.loc,{openEvent:q.eid});
   else if(state.location!==q.loc) moveTo(q.loc);else showToast("이곳의 사건을 모두 확인했어요. 다른 장소를 둘러보세요.");
 }
-function chooseEpilogue(path) {
-  state.mainStage=4;state.flags.ending=path;state.flags.storyComplete=true;
-  state.sect=path==="sect"?(state.sect==="아직 정하지 않음"?"청운문":state.sect):state.sect;
-  addLog("후일담",path==="sect"?"청운문에서 더 배우기로 했다. 사부와 동문이 돌아온 너를 맞는다.":"표국과 길을 나서기로 했다. 새로운 길과 사람을 만나러 간다.");save();render();
-}
 function importFile(file) {
   if(!file)return;
-  if(file.size>1000000){showToast("저장 파일이 너무 큽니다 (최대 1MB).");return;}
-  const reader=new FileReader();
+  if(file.size>1000000){showToast('저장 파일이 너무 큽니다 (최대 1MB).');return;}
+  const generation=++importGeneration,reader=new FileReader();
   reader.onload=()=>{
-    try {
-      const imported=JSON.parse(reader.result);
-      const restored=normalizeSave(imported,makeInitial("나그네"));
-      state=restored;
-      activeCue=null;setBgmCue(state.combat?.id==="final"?"final":state.combat?"battle":state.mainStage>=7?"training":state.location==="sect"&&state.mainStage>=4?"training":"ambient");
-      save();closeModal();render();showToast("저장 파일을 불러왔습니다.");
-    } catch { showToast("이 게임의 저장 파일이 아니거나 파일이 손상됐습니다."); }
+    if(generation!==importGeneration)return;
+    try{reviewLoad(normalizeSave(JSON.parse(reader.result),makeInitial('나그네')));}
+    catch{showToast('이 게임의 저장 파일이 아니거나 파일이 손상됐습니다. 현재 여정은 그대로 유지됩니다.');}
   };
-  reader.readAsText(file);
+  reader.onerror=()=>showToast('파일을 읽지 못했습니다. 다른 백업을 선택해 주세요.');reader.readAsText(file);
 }
-
 document.addEventListener("click",(event)=>{
+  const slot=event.target.closest('[data-slot-save],[data-confirm-slot],[data-load-key]');
+  if(slot){if(slot.dataset.loadKey)reviewLoad(slot.dataset.loadKey===SAVE_KEY?storedSave():slotRecord(slot.dataset.loadKey));else saveSlot(Number(slot.dataset.slotSave||slot.dataset.confirmSlot),Boolean(slot.dataset.confirmSlot));return;}
   const developerRoot=event.target.closest("#modalContent");
   if(developerRoot&&document.getElementById("modal")?.classList.contains("developer-tools-modal")){
     const preview=event.target.closest("[data-dev-preview]");
@@ -946,14 +1060,23 @@ document.addEventListener("click",(event)=>{
   const button=event.target.closest("[data-action]");if(!button)return;
   if(button.disabled)return;
   const action=button.dataset.action;
+  if(storageConflict&&!['reload-latest','confirm-load','export','download-save','select-backup','save-panel','settings','return','title'].includes(action)){showStorageConflict();return;}
+  if(action==='reload-latest'){const data=storedSave();if(data)resumeGame(data);return;}
+  if(action==='confirm-load'){confirmLoad();return;}
+  if(action==='advance-dialogue')return advanceDialogue();
+  if(action==='skip-dialogue'){const beats=chapterDialogue[state?.activeEventId];if(beats){state.dialogueStep=beats.length;save();render();}return;}
+  if(action==='toggle-motion'){preferences.reducedMotion=!preferences.reducedMotion;savePreferences();render();showSettings();return;}
+  if(action==='test-sound'){playSfx('reward');return;}
+  if(action==='fullscreen'){if(document.fullscreenElement)document.exitFullscreen?.().catch(()=>showToast('전체 화면을 종료하지 못했습니다.'));else document.documentElement.requestFullscreen?.().catch(()=>showToast('이 브라우저에서는 전체 화면을 사용할 수 없습니다.'));return;}
+  if(action==='title'){if(state&&!storageConflict&&!save())return;state=null;storageConflict=false;importGeneration++;closeModal();setBgmCue('ambient');render();return;}
   if(action==="continue-result"){state.result=null;save();render();return;}
   if(action==="new-game")return newGame();
-  if(action==="continue"){const data=storedSave();if(data){state=data;render();}return;}
+  if(action==="continue"){const data=storedSave();if(data)resumeGame(data);return;}
   if(action==="start-default")return beginGame("");
   if(action==="opening-choice")return openingChoice(Number(button.dataset.index));
   if(action==="advance-encounter")return advanceEncounter();
   if(action==="choose-event") {const ev=events.find((e)=>e.id===state.activeEventId);if(ev)return applyChoice(ev,ev.choices[Number(button.dataset.index)]);return;}
-  if(action==="open-event") {const ev=events.find(e=>e.id===button.dataset.event);if(!state.combat&&ev&&availableEvent(ev)){state.result=null;state.activeEventId=ev.id;save();render();}return;}
+  if(action==="open-event") {const ev=events.find(e=>e.id===button.dataset.event);if(!state.combat&&ev&&availableEvent(ev)){state.result=null;state.activeEventId=ev.id;state.dialogueStep=0;save();render();}return;}
   if(action==="leave-event"){state.activeEventId=null;save();render();return;}
   if(action==="combat-move")return combatMove(button.dataset.move);
   if(action==="combat-items") {
@@ -972,19 +1095,18 @@ document.addEventListener("click",(event)=>{
   if(action==="buy")return buyItem(button.dataset.item);
   if(action==="rest")return restAtInn();
   if(action==="shop-filter"){shopFilter=button.dataset.filter;return showShop();}
-  if(action==="manual-save"){save();showToast("현재 여정을 저장했습니다.");return;}
+  if(action==="manual-save"){if(save())showToast("현재 여정을 저장했습니다.");return;}
   if(action==="export")return exportSave();
   if(action==="download-save")return downloadSave();
   if(action==="select-backup"){document.getElementById("saveBackup")?.select();return;}
   if(action==="import-prompt")return document.getElementById("importFile")?.click();
   if(action==="log")return showLog();
   if(action==="settings")return showSettings();
-  if(action==="toggle-guide"){state.guide=!state.guide;save();render();return showSettings();}
-  if(action==="toggle-text"){state.largeText=!state.largeText;save();showSettings();render();return;}
+  if(action==="toggle-guide"){preferences.guide=!preferences.guide;if(state){state.guide=preferences.guide;save();}savePreferences();render();return showSettings();}
+  if(action==="toggle-text"){preferences.largeText=!preferences.largeText;if(state){state.largeText=preferences.largeText;save();}savePreferences();render();return showSettings();}
   if(action==="save-panel")return showSavePanel();
   if(action==="developer-tools")return showDeveloperTools();
   if(action==="return"){closeModal();return;}
-  if(action==="epilogue")return chooseEpilogue(button.dataset.path);
 });
 
 document.getElementById("modalClose").addEventListener("click",closeModal);
@@ -1008,13 +1130,15 @@ document.getElementById("modalContent").addEventListener("submit",(event)=>{
 });
 document.getElementById("modalContent").addEventListener("change",(event)=>{
   if(event.target.id==="importFile")importFile(event.target.files?.[0]);
+  if(event.target.dataset.setting==='textSpeed'){preferences.textSpeed=Number(event.target.value);savePreferences();}
 });
+document.getElementById('app').addEventListener('change',event=>{if(event.target.matches('[data-combat-style]')&&state?.combat&&!state.combat.turnPending&&state.skills.includes(event.target.value)){state.combat.style=event.target.value;save();render();}});
 document.getElementById("modalContent").addEventListener("input",(event)=>{
   const control=event.target.closest("[data-audio]");if(!control)return;
   const amount=Number(control.value)/100;
   audioSettings[control.dataset.audio]=amount;
   try{localStorage.setItem(AUDIO_KEY,JSON.stringify(audioSettings));}catch{}
-  if(control.dataset.audio==="bgm")activeTracks().forEach((track)=>{if(!track.paused)track.volume=amount;});
+  if(control.dataset.audio==='bgm'||control.dataset.audio==='master'){clearInterval(fadeTimer);activeTracks().forEach((track)=>{if(track===activeCue&&!track.paused)track.volume=audioSettings.master*audioSettings.bgm;else{track.pause();track.volume=0;}});}
   const label=control.closest("label")?.querySelector("b");if(label)label.textContent=`${control.value}%`;
 });
 document.addEventListener("keydown",(event)=>{
@@ -1025,22 +1149,21 @@ document.addEventListener("keydown",(event)=>{
     else if(!event.shiftKey&&document.activeElement===last){event.preventDefault();first?.focus();}
   }
   if(event.key==="Escape"&&!document.getElementById("modalBackdrop").hidden){closeModal();return;}
+  if(storageConflict)return;
   if(event.target.closest("input,textarea,select")||!document.getElementById("modalBackdrop").hidden)return;
-  if(state?.tutorial==="encounter"&&event.key==="Enter"&&!event.target.closest("button")){event.preventDefault();advanceEncounter();return;}
+  if(event.repeat)return;
+  if(state?.tutorial==='encounter'&&['Enter',' '].includes(event.key)&&!event.target.closest('button')){event.preventDefault();advanceEncounter();return;}
+  if(state?.activeEventId&&chapterDialogue[state.activeEventId]&&(state.dialogueStep||0)<chapterDialogue[state.activeEventId].length&&['Enter',' '].includes(event.key)&&!event.target.closest('button')){event.preventDefault();advanceDialogue();return;}
   if(!state?.combat||state.combat.turnPending)return;
   const moves={"1":"attack","2":"defend","3":"dodge","4":"skill","6":"flee"};
   if(moves[event.key])combatMove(moves[event.key]);
   else if(event.key==="5"){const owned=Object.entries(state.items).some(([id,count])=>count>0&&itemData[id]?.type==="medicine");if(owned)document.querySelector('[data-action="combat-items"]')?.click();}
 });
 
-state=storedSave();
-if(state?.version!==1 || !state?.started || !locationData[state.location])state=null;
-if(state){
-  state.gear={weapon:null,armor:null,...(state.gear||{})};state.items||={};state.skills||=[];state.flags||={};state.trust||={};state.log||=[];state.visited||=[state.location];
-  if(state.combat?.id==="intro")state.tutorial="combat";
-}
-activeCue=state?.combat?.id==="final"?finalBgm:state?.combat?battleBgm:state?.mainStage>=7||state?.location==="sect"&&state?.mainStage>=4?trainingBgm:mainBgm;
-if(state?.combat)state.combat.resolveTimer=false;
-document.addEventListener("visibilitychange",()=>{if(document.hidden)stopAllMusic();else if(musicEnabled)startMusic();});
-syncMusicButton();
-render();
+state=null;
+activeCue=mainBgm;
+document.addEventListener('visibilitychange',()=>{if(document.hidden){stopAllMusic();finishTyping?.();}else if(musicEnabled)startMusic();});
+window.addEventListener('storage',(event)=>{if(event.key===SAVE_KEY&&state&&event.newValue!==observedSave){storageConflict=true;showStorageConflict();}});
+document.body.classList.remove('booting');document.querySelector('.topbar').inert=false;
+syncMusicButton();render();
+if(typeof Image!=='undefined'){warmCharacters();for(const src of ['assets/portraits-atlas.png','assets/items-atlas.png','assets/weapon-extras-atlas.png'])preloadImage(src);for(const loc of ['market','alley','sect','forest'])warmScene(loc,window.matchMedia('(max-aspect-ratio:3/4)').matches);}

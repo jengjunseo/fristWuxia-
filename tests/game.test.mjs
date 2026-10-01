@@ -4,15 +4,17 @@ import vm from 'node:vm';
 import {readFile} from 'node:fs/promises';
 import * as data from '../events.js';
 import {normalizeSave} from '../save-state.js';
+import {readSave,writeSave,BACKUP_KEY,SLOT_KEY} from '../storage.js';
+import {chapterDialogue,endingLetters} from '../narrative.js';
 
 const source=(await readFile(new URL('../game.js',import.meta.url),'utf8')).replace(/^import .*;\r?\n/gm,'');
 function game() {
-  const nodes=new Map(),tasks=[];
+  const nodes=new Map(),tasks=[],store=new Map();
   const node=()=>({innerHTML:'',hidden:true,dataset:{},classList:{add(){},remove(){},toggle(){}},setAttribute(){},addEventListener(){},querySelector(){return null},querySelectorAll(){return []},focus(){},style:{},inert:false});
   const get=id=>{if(!nodes.has(id))nodes.set(id,node());return nodes.get(id)};
   const audio=()=>({paused:true,volume:0,play(){this.paused=false;return Promise.resolve()},pause(){this.paused=true}});
   Object.assign(get('mainBgm'),audio());
-  const ctx=vm.createContext({...data,normalizeSave,console,performance,Audio:function(){return audio()},localStorage:{getItem(){return null},setItem(){}},document:{getElementById:get,querySelector:get,addEventListener(){},body:node()},window:{matchMedia(){return {matches:false}},addEventListener(){},innerWidth:1600,innerHeight:900,scrollTo(){}},setTimeout(fn){tasks.push(fn);return tasks.length},clearTimeout(){},setInterval(){return 1},clearInterval(){},requestAnimationFrame(){}});
+  const ctx=vm.createContext({...data,normalizeSave,readSave,writeSave,BACKUP_KEY,SLOT_KEY,chapterDialogue,endingLetters,URLSearchParams,console,performance,Audio:function(){return audio()},localStorage:{getItem(k){return store.get(k)||null},setItem(k,v){store.set(k,v)}},document:{getElementById:get,querySelector:get,addEventListener(){},body:node()},window:{matchMedia(){return {matches:false}},addEventListener(){},innerWidth:1600,innerHeight:900,scrollTo(){}},setTimeout(fn){tasks.push(fn);return tasks.length},clearTimeout(){},setInterval(){return 1},clearInterval(){},requestAnimationFrame(){},cancelAnimationFrame(){}});
   vm.runInContext(source,ctx);
   const run=s=>vm.runInContext(s,ctx);
   run('state=makeInitial("검수");');
@@ -25,7 +27,7 @@ test('all 57 events have valid references, choices and effects',()=>{
 });
 test('all opening choices and rewards lead to a playable complete ending',()=>{
   for(let opening=0;opening<3;opening++)for(const reward of ['weapon','gauntlet','manual']){
-    const g=game();g.run(`openingChoice(${opening});for(let i=0;i<5;i++)advanceEncounter();`);
+    const g=game();g.run(`openingChoice(${opening});for(let i=0;i<5;i++){inputAfter=0;advanceEncounter();}`);
     while(g.get().combat){g.run('combatMove("attack")');g.flush();}
     assert.equal(g.get().tutorial,'reward');
     g.run(`chooseReward("${reward}")`);
@@ -87,5 +89,69 @@ test('all event branches apply and render without errors',()=>{
     const g=game();g.run(`state.tutorial="free";state.mainStage=${e.requirements.mainStage??e.requirements.stage??6};state.location="${e.location}";state.coin=100;state.flags=${JSON.stringify(Object.fromEntries((e.requirements.flags||[]).map(f=>[f,true])))};`);
     g.run(`const ev=events.find(e=>e.id==="${e.id}");state.activeEventId=ev.id;renderEventScene(ev);applyChoice(ev,ev.choices[${i}]);`);
     assert.ok(Number.isFinite(g.get().hp),e.id);assert.ok(g.get().combat || g.get().done.includes(e.id) || g.get().lastDay[e.id] != null,e.id);
+  }
+});
+test('autosave retains a recoverable previous record and slots stay independent',()=>{
+  const g=game();g.run('state.tutorial="free";state.coin=2;save();saveSlot(1);state.coin=8;save();');
+  assert.equal(g.run('slotRecord(BACKUP_KEY).coin'),2);
+  assert.equal(g.run('slotRecord(SLOT_KEY+1).coin'),2);
+  assert.equal(g.run('storedSave().coin'),8);
+  g.run('localStorage.setItem(SAVE_KEY,"broken JSON")');
+  assert.equal(g.run('storedSave().coin'),2);
+});
+test('quota failure returns false and preserves the last valid autosave',()=>{
+  const g=game();g.run('save();state.coin=9;localStorage.setItem=()=>{throw new Error("QuotaExceededError")};');
+  assert.equal(g.run('save()'),false);
+  assert.equal(g.run('storedSave().coin'),0);
+});
+test('foreign writes stop this window before overwriting the newer record',()=>{
+  const g=game();g.run('save();const other={...state,coin:19};localStorage.setItem(SAVE_KEY,JSON.stringify(other));state.coin=3;');
+  assert.equal(g.run('save()'),false);assert.equal(g.run('storageConflict'),true);
+  assert.equal(g.run('storedSave().coin'),19);
+});
+test('nested corrupted fields and dialogue positions are rejected; normalization is pure',()=>{
+  const g=game(),base=g.get();
+  for(const patch of [{trust:{mentor:'2'}},{flags:{bad:{deep:true}}},{lastDay:{bad:-1}},{encounterStep:'4'},{dialogueStep:99}])assert.throws(()=>normalizeSave({...base,...patch},base));
+  const legacy={...base,gear:{weapon:'weapon-practice-sword'},items:{}};
+  const before=JSON.stringify(legacy);normalizeSave(legacy,base);assert.equal(JSON.stringify(legacy),before);
+  const extraGear=normalizeSave({...base,gear:{weapon:null,armor:null,extra:{bad:true}}},base);
+  assert.deepEqual(extraGear.gear,{weapon:null,armor:null});assert.deepEqual(extraGear.items,{});
+});
+test('a menu pauses a pending combat turn and closing it resolves exactly once',()=>{
+  const g=game();g.run('startCombat("intro");combatMove("attack");document.getElementById("modalBackdrop").hidden=false;');
+  g.tasks.shift()();assert.equal(g.get().combat.enemyHp,22);assert.equal(g.get().combat.round,0);
+  g.run('document.getElementById("modalBackdrop").hidden=true');g.flush();assert.equal(g.get().combat.enemyHp,16);assert.equal(g.get().combat.round,1);
+});
+test('loading archives unsaved in-memory progress and aborts if preservation fails',()=>{
+  const g=game();g.run('pendingLoad=makeInitial("불러올 기록");state.name="현재 기록";state.coin=17;confirmLoad();');
+  assert.equal(g.get().name,'불러올 기록');assert.equal(g.run('JSON.parse(localStorage.getItem(SLOT_KEY+"before-load")).coin'),17);
+  const broken=game();broken.run('pendingLoad=makeInitial("불러올 기록");state.name="현재 기록";localStorage.setItem=()=>{throw new Error("full")};confirmLoad();');
+  assert.equal(broken.get().name,'현재 기록');
+});
+test('fist and lightness are distinct attack-defense and attack-evasion techniques',()=>{
+  const fist=game();fist.run('state.skills=["sword","fist"];startCombat("intro");state.combat.style="fist";combatMove("skill");');fist.flush();
+  assert.equal(fist.get().combat.enemyHp,12);assert.equal(fist.get().hp,41);assert.equal(fist.get().qi,10);
+  const feet=game();feet.run('state.skills=["sword","lightness"];startCombat("intro");state.combat.style="lightness";combatMove("skill");');feet.flush();
+  assert.equal(feet.get().combat.enemyHp,14);assert.equal(feet.get().hp,42);assert.equal(feet.get().qi,10);
+});
+test('new journey archives the previous playthrough and resets its timers',()=>{
+  const g=game();g.run('state.coin=17;save();beginGame("새벽");');
+  assert.equal(g.run('slotRecord(SLOT_KEY+"departure").coin'),17);
+  assert.equal(g.get().name,'새벽');assert.equal(g.get().coin,0);
+});
+test('every main-story choice combination can finish with each training style',()=>{
+  const ids=['case-ledger','case-courier','case-mountain','story-epilogue','story-training','story-midboss','story-final'];
+  for(let route=0;route<128;route++){
+    const g=game();g.run('state.tutorial="reward";chooseReward("manual");state.coin=3;');
+    for(let n=0;n<ids.length;n++){
+      g.run(`setQuestTarget();state.dialogueStep=chapterDialogue["${ids[n]}"].length;var chapter=events.find(e=>e.id==="${ids[n]}");applyChoice(chapter,chapter.choices[${(route>>n)&1}]);`);
+      for(let turn=0;g.get().combat&&turn<30;turn++){
+        g.run('combatMove(state.skills.length&&state.qi>=8?"skill":isHeavy(state.combat)&&state.qi>=2?"dodge":"attack")');g.flush();
+        if(g.get().injury)g.run('acceptHelp()');
+      }
+      assert.equal(g.get().combat,null,ids[n]+' route '+route);
+    }
+    assert.equal(g.get().mainStage,7);assert.ok(g.get().flags.titleEarned);
+    assert.equal(normalizeSave(g.get(),g.run('makeInitial("검수")')).mainStage,7);
   }
 });

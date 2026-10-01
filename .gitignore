@@ -1,9 +1,8 @@
-node_modules/
 dist/
+node_modules/
+*.log
 .vercel/
+.env*
 assets/**/originals/
 assets/**/*source*/
 assets/**/*source*.zip
-
-.vercel
-.env*
