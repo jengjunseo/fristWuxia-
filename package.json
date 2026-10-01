@@ -1,0 +1,10 @@
+{
+  "name": "gangho-first-steps",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "node serve.mjs",
+    "test": "node --test --test-isolation=none",
+    "build": "node scripts/build.mjs"
+  }
+}

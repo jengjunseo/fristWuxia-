@@ -1,0 +1,9 @@
+node_modules/
+dist/
+.vercel/
+assets/**/originals/
+assets/**/*source*/
+assets/**/*source*.zip
+
+.vercel
+.env*
