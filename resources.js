@@ -12,8 +12,7 @@ export function preloadImage(src) {
 }
 
 export function warmScene(location, portrait = false, final = false) {
-  const suffix = portrait ? 'mobile' : 'wide';
-  const bg = final ? `assets/remaster/final-${suffix}.webp` : location === 'sect' ? `assets/remaster/training-${suffix}.webp` : location === 'alley' ? `assets/remaster/alley-${suffix}.webp` : location === 'market' ? 'assets/market-hero.png' : 'assets/locations-atlas.png';
+  const bg = `assets/vn/${final?'duel':location==='sect'?'mountain':location==='alley'?'alley':['forest','escort','stockade'].includes(location)?'caravan':'awakening'}.webp`;
   return preloadImage(bg);
 }
 

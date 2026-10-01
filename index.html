@@ -3,14 +3,12 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-  <meta name="description" content="밥 한 끼와 목검 하나에서 시작되는 완결된 한국어 선택형 무협 RPG. 검보다 먼저 사람을 살피는 당신의 선택이 강호에 이름을 남깁니다.">
-  <meta name="theme-color" content="#193c2d">
-  <title>강호 첫걸음 — 밥 한 끼에서 시작된 인연</title>
+  <meta name="description" content="강호 첫걸음. 한국어 무협 비주얼 노벨 RPG.">
+  <meta name="theme-color" content="#101222">
+  <title>강호 첫걸음</title>
   <link rel="icon" href="assets/seal.svg" type="image/svg+xml">
   <link rel="preload" href="assets/fonts/GowunBatang-Regular.woff2" as="font" type="font/woff2" crossorigin>
-  <link rel="stylesheet" href="style.css?v=8">
-  <link rel="stylesheet" href="beta.css?v=1">
-  <link rel="stylesheet" href="release.css?v=1">
+  <link rel="stylesheet" href="vn.css?v=2.0.0">
 </head>
 <body class="booting">
   <div id="worldBackdrop" class="world-backdrop" aria-hidden="true"></div>
@@ -18,13 +16,13 @@
   <header class="topbar" inert>
     <a class="brand" href="#" id="brandHome" aria-label="강호 첫걸음 처음으로">
       <span class="brand-stamp">江湖</span>
-      <span><strong>강호 첫걸음</strong><small>무림 초보의 모험기</small></span>
+      <strong>강호 첫걸음</strong>
     </a>
     <div class="top-actions">
       <span class="autosave" id="saveStatus" hidden><i></i> 자동 저장</span>
       <button class="icon-button music-button" id="musicToggle" type="button" aria-label="배경 음악 끄기" aria-pressed="true" title="배경 음악 끄기">♫</button>
-      <button class="icon-button" data-panel="glossary" aria-label="강호 수첩 열기" title="강호 수첩">?</button>
-      <button class="icon-button" id="menuButton" aria-label="메뉴 열기" title="메뉴">☰</button>
+      <button class="icon-button" data-panel="glossary" aria-label="강호 수첩 열기" title="강호 수첩"><span data-icon="scroll"></span></button>
+      <button class="icon-button" id="menuButton" aria-label="메뉴 열기" title="메뉴"><span data-icon="menu"></span></button>
     </div>
   </header>
 
@@ -33,11 +31,11 @@
   </main>
 
   <nav class="quick-nav" id="quickNav" aria-label="게임 메뉴" hidden>
-    <button data-panel="map"><span>地</span> 지도</button>
-    <button data-panel="inventory"><span>囊</span> 가방</button>
-    <button data-panel="glossary"><span>冊</span> 수첩</button>
-    <button data-panel="people"><span>人</span> 인물</button>
-    <button data-panel="save"><span>書</span> 저장</button>
+    <button data-panel="map"><span data-icon="map"></span>지도</button>
+    <button data-panel="inventory"><span data-icon="bag"></span>가방</button>
+    <button data-panel="glossary"><span data-icon="scroll"></span>수첩</button>
+    <button data-panel="people"><span data-icon="people"></span>인물</button>
+    <button data-panel="save"><span data-icon="seal"></span>저장</button>
   </nav>
 
   <div class="modal-backdrop" id="modalBackdrop" hidden>
@@ -47,9 +45,9 @@
     </section>
   </div>
 
-  <audio id="mainBgm" src="assets/asianoriental2.ogg" preload="none" loop></audio>
+  <audio id="mainBgm" src="assets/music/eastern-thought.mp3" preload="none" loop></audio>
   <div id="toast" class="toast" role="status" aria-live="polite"></div>
   <noscript><p class="no-script">이 게임은 JavaScript가 필요합니다. 브라우저에서 JavaScript를 허용하고 다시 열어 주세요.</p></noscript>
-  <script type="module" src="boot.js?v=1.0.0"></script>
+  <script type="module" src="boot.js?v=2.0.0"></script>
 </body>
 </html>

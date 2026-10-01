@@ -39,6 +39,10 @@ export function normalizeSave(input, initial) {
   if (s.activeEventId && !events.some(e=>e.id===s.activeEventId)) s.activeEventId=null;
   if(s.activeEventId&&s.done.includes(s.activeEventId))s.activeEventId=null;
   if(s.dialogueStep!=null&&(!Number.isInteger(s.dialogueStep)||s.dialogueStep<0||s.dialogueStep>20))throw new Error('Invalid dialogue');
+  if(s.prologueStep!=null&&(!Number.isInteger(s.prologueStep)||s.prologueStep<0||s.prologueStep>16))throw new Error('Invalid prologue');
+  if(typeof s.nameChosen!=='boolean')throw new Error('Invalid name state');
+  if(s.prologueStep!=null&&(s.tutorial!=='intro'||s.combat||s.injury||s.activeEventId||s.mainStage!==0||s.flags.prologueComplete))throw new Error('Invalid opening state');
+  if(s.prologueStep>12&&!s.nameChosen)throw new Error('Missing reincarnated name');
   if(s.encounterStep!=null&&(!Number.isInteger(s.encounterStep)||s.encounterStep<0||s.encounterStep>4))throw new Error('Invalid encounter');
   if(s.tutorial==='encounter'&&s.encounterStep==null)s.encounterStep=0;
   if (s.pendingCombatChoice) {

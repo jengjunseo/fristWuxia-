@@ -6,6 +6,9 @@ import * as data from '../events.js';
 import {normalizeSave} from '../save-state.js';
 import {readSave,writeSave,BACKUP_KEY,SLOT_KEY} from '../storage.js';
 import {chapterDialogue,endingLetters} from '../narrative.js';
+import {prologue,sceneIllustrations} from '../prologue.js';
+import {MUSIC} from '../music.js';
+import {icon} from '../icons.js';
 
 const source=(await readFile(new URL('../game.js',import.meta.url),'utf8')).replace(/^import .*;\r?\n/gm,'');
 function game() {
@@ -14,7 +17,7 @@ function game() {
   const get=id=>{if(!nodes.has(id))nodes.set(id,node());return nodes.get(id)};
   const audio=()=>({paused:true,volume:0,play(){this.paused=false;return Promise.resolve()},pause(){this.paused=true}});
   Object.assign(get('mainBgm'),audio());
-  const ctx=vm.createContext({...data,normalizeSave,readSave,writeSave,BACKUP_KEY,SLOT_KEY,chapterDialogue,endingLetters,URLSearchParams,console,performance,Audio:function(){return audio()},localStorage:{getItem(k){return store.get(k)||null},setItem(k,v){store.set(k,v)}},document:{getElementById:get,querySelector:get,addEventListener(){},body:node()},window:{matchMedia(){return {matches:false}},addEventListener(){},innerWidth:1600,innerHeight:900,scrollTo(){}},setTimeout(fn){tasks.push(fn);return tasks.length},clearTimeout(){},setInterval(){return 1},clearInterval(){},requestAnimationFrame(){},cancelAnimationFrame(){}});
+  const ctx=vm.createContext({...data,normalizeSave,readSave,writeSave,BACKUP_KEY,SLOT_KEY,chapterDialogue,endingLetters,prologue,sceneIllustrations,MUSIC,icon,URLSearchParams,console,performance,Audio:function(){return audio()},localStorage:{getItem(k){return store.get(k)||null},setItem(k,v){store.set(k,v)}},document:{getElementById:get,querySelector:selector=>selector.includes("[data-typewriter]")?null:get(selector),querySelectorAll(){return []},addEventListener(){},body:node()},window:{matchMedia(){return {matches:false}},addEventListener(){},innerWidth:1600,innerHeight:900,scrollTo(){}},setTimeout(fn){tasks.push(fn);return tasks.length},clearTimeout(){},setInterval(){return 1},clearInterval(){},requestAnimationFrame(){},cancelAnimationFrame(){}});
   vm.runInContext(source,ctx);
   const run=s=>vm.runInContext(s,ctx);
   run('state=makeInitial("검수");');
@@ -137,7 +140,40 @@ test('fist and lightness are distinct attack-defense and attack-evasion techniqu
 test('new journey archives the previous playthrough and resets its timers',()=>{
   const g=game();g.run('state.coin=17;save();beginGame("새벽");');
   assert.equal(g.run('slotRecord(SLOT_KEY+"departure").coin'),17);
-  assert.equal(g.get().name,'새벽');assert.equal(g.get().coin,0);
+  assert.equal(g.get().name,'나');assert.equal(g.get().coin,0);assert.equal(g.get().prologueStep,0);assert.equal(g.get().nameChosen,false);
+});
+test('modern opening precedes reincarnation and only the elder can ask for a name',()=>{
+  const g=game();g.run('beginGame("");openingChoice(0);chooseReincarnationName("성급한 이름");');
+  assert.equal(g.get().prologueStep,0);assert.equal(g.get().name,'나');assert.equal(g.get().coin,0);
+  assert.match(g.run('renderPrologue()'),/office.webp/);assert.ok(!g.run('renderPrologue()').includes('reincarnationNameForm'));
+  for(let step=0;step<12;step++){assert.equal(g.get().prologueStep,step);g.run('inputAfter=0;advancePrologue();');}
+  assert.equal(g.get().prologueStep,12);assert.equal(prologue[12].text,'공의 이름은 무엇이요?');
+  assert.match(g.run('renderPrologue()'),/reincarnationNameForm/);g.run('inputAfter=0;advancePrologue();chooseReincarnationName("   ");');assert.equal(g.get().prologueStep,12);
+  g.run('chooseReincarnationName("  청명  ");');assert.equal(g.get().name,'청명');assert.equal(g.get().nameChosen,true);assert.equal(g.get().prologueStep,13);
+  assert.match(g.run('renderPrologue()'),/청명 공이라/);
+  for(let step=13;step<prologue.length;step++)g.run('inputAfter=0;advancePrologue();');
+  assert.equal(g.get().prologueStep,null);assert.ok(g.get().flags.prologueComplete);assert.equal(g.get().tutorial,'intro');g.run('openingChoice(0);');assert.equal(g.get().tutorial,'encounter');
+});
+test('opening saves resume at the same line including the unanswered name question',()=>{
+  for(const step of [0,3,6,8,12,13,16]){
+    const g=game();g.run(`beginGame("");state.prologueStep=${step};state.nameChosen=${step>12};`);
+    const saved=normalizeSave(g.get(),g.run('makeInitial("검수")'));g.run('resumeGame('+JSON.stringify(saved)+')');
+    assert.equal(g.get().prologueStep,step);assert.equal(g.run('sceneMusic()'),prologue[step].cue);
+  }
+  const g=game();g.run('beginGame("")');const saved=g.get(),initial=g.run('makeInitial("검수")');
+  for(const patch of [{prologueStep:-1},{prologueStep:17},{prologueStep:1.5},{prologueStep:13,nameChosen:false},{nameChosen:'yes'},{prologueStep:2,mainStage:4},{prologueStep:2,tutorial:'free'}])assert.throws(()=>normalizeSave({...saved,...patch},initial));
+});
+test('a click finishes a typing sentence before advancing the story',()=>{
+  const g=game();g.run('beginGame("");var completed=0;finishTyping=()=>{completed++;finishTyping=null;};inputAfter=0;advancePrologue();');
+  assert.equal(g.run('completed'),1);assert.equal(g.get().prologueStep,0);g.run('inputAfter=0;advancePrologue();');assert.equal(g.get().prologueStep,1);
+});
+test('music follows the scene and crossfades before pausing the previous track',()=>{
+  const g=game();g.run('var musicClock=0;performance={now:()=>musicClock};var fadeTick;setInterval=fn=>{fadeTick=fn;return 1;};state=null;stopAllMusic();crossfadeCue("title");musicClock=1100;fadeTick();crossfadeCue("office");musicClock=1650;fadeTick();');
+  assert.ok(g.run('musicTracks.title.volume>0&&musicTracks.office.volume>0'));
+  g.run('musicClock=2200;fadeTick();');assert.ok(g.run('musicTracks.title.paused&&!musicTracks.office.paused'));
+  assert.equal(g.run('musicTracks.office.volume'),g.run('musicVolume()'));
+  g.run('crossfadeCue("silence");');assert.ok(g.run('activeTracks().every(track=>track.paused&&track.volume===0)'));
+  for(const [code,cue] of [['state=makeInitial("검수");state.tutorial="free";state.location="market"','market'],['state.location="sect"','training'],['state.activeEventId="case-ledger"','mystery'],['state.activeEventId=null;state.combat={id:"intro"}','battle'],['state.combat={id:"final"}','final'],['state.combat=null;state.mainStage=7','ending']]){g.run(code);assert.equal(g.run('sceneMusic()'),cue);}
 });
 test('every main-story choice combination can finish with each training style',()=>{
   const ids=['case-ledger','case-courier','case-mountain','story-epilogue','story-training','story-midboss','story-final'];

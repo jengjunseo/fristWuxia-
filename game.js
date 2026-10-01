@@ -4,19 +4,23 @@ import { normalizeSave } from "./save-state.js";
 import { readSave, writeSave, BACKUP_KEY, SLOT_KEY } from "./storage.js";
 import { chapterDialogue, endingLetters } from "./narrative.js";
 import { preloadImage, warmScene, warmCharacters } from "./resources.js";
+import { prologue, sceneIllustrations } from "./prologue.js";
+import { MUSIC } from "./music.js";
+import { icon } from "./icons.js";
 
 const SAVE_KEY = "jianghu-first-steps-save-v1";
 const MUSIC_KEY = "jianghu-first-steps-music-v1";
 const AUDIO_KEY = "jianghu-first-steps-audio-v1";
 const SETTINGS_KEY = "jianghu-first-steps-settings-v1";
 const QA_MODE = new URLSearchParams(window.location?.search || '').has('qa');
-let preferences = {guide:true, largeText:false, textSpeed:24, reducedMotion:false};
-try { const p=JSON.parse(localStorage.getItem(SETTINGS_KEY)||'{}'); for(const k of ['guide','largeText','reducedMotion'])if(typeof p[k]==='boolean')preferences[k]=p[k];if([0,24,45].includes(p.textSpeed))preferences.textSpeed=p.textSpeed; } catch {}
+let preferences = {guide:true, largeText:false, textSpeed:18, reducedMotion:false,edition:2};
+try { const p=JSON.parse(localStorage.getItem(SETTINGS_KEY)||'{}'); for(const k of ['guide','largeText','reducedMotion'])if(typeof p[k]==='boolean')preferences[k]=p[k];if(p.edition===2&&[0,18,32].includes(p.textSpeed))preferences.textSpeed=p.textSpeed; } catch {}
 const writerId = Date.now().toString(36) + Math.random().toString(36).slice(2);
 let observedSave = null, storageConflict = false, importGeneration = 0;
 try { observedSave=localStorage.getItem(SAVE_KEY); } catch {}
 let typingFrame=null, finishTyping=null, inputAfter=0;
 let lastCombatFocus=null;
+let renderRevision=0;
 const TERMS = {
   "강호": "무공을 익힌 사람들과 여러 문파, 표국, 장사꾼이 어울려 살아가는 세상.",
   "무공": "몸을 단련해 싸우거나 몸을 지키는 기술. 처음엔 기본 동작부터 배운다.",
@@ -43,20 +47,26 @@ mainBgm.loop = true;
 mainBgm.volume = 0;
 let musicPlaying = false;
 let musicStarting = false;
-let audioSettings = { master:0.8, bgm: 0.28, sfx: 0.62 };
+let audioSettings = { master:0.8, bgm: 0.55, sfx: 0.62 };
 try { const settings=JSON.parse(localStorage.getItem(AUDIO_KEY)||"{}"); for(const key of ["master","bgm","sfx"]) if(Number.isFinite(settings[key]))audioSettings[key]=Math.max(0,Math.min(1,settings[key])); } catch {}
-const battleBgm = new Audio("assets/remaster/samurai-battle.mp3");
-const trainingBgm = new Audio("assets/remaster/samurai-final-erhu.mp3");
-const finalBgm = new Audio("assets/remaster/samurai-final-base.mp3");
-battleBgm.loop = trainingBgm.loop = finalBgm.loop = true;
-battleBgm.preload = trainingBgm.preload = finalBgm.preload = "none";
+const musicTracks=Object.fromEntries(MUSIC.map((track,i)=>{
+  const audio=i===0?mainBgm:new Audio('assets/music/'+track.file);
+  if(i===0)audio.src='assets/music/'+track.file;
+  audio.loop=true;audio.preload='none';audio.volume=0;
+  return [track.cue,audio];
+}));
+let desiredCue='title';
 let activeCue = null;
 let fadeTimer = null;
 let audioContext = null;
 let effectsBus=null, lastEffectAt=0;
-function activeTracks() { return [mainBgm, battleBgm, trainingBgm, finalBgm]; }
+function activeTracks() { return Object.values(musicTracks); }
+function musicVolume(){return audioSettings.master*audioSettings.bgm*(MUSIC.find(track=>track.cue===desiredCue)?.gain||1);}
 function crossfadeCue(cue) {
-  const target = cue === "battle" ? battleBgm : cue === "training" ? trainingBgm : cue === "final" ? finalBgm : mainBgm;
+  if(cue==='ambient')cue='market';
+  desiredCue=cue;
+  const target = musicTracks[cue]||null;
+  if(!target){activeCue=null;stopAllMusic();return;}
   if (activeCue === target && !target.paused) return;
   activeCue = target;
   if (!musicEnabled || document.hidden) return;
@@ -65,11 +75,12 @@ function crossfadeCue(cue) {
   if (target.paused) target.volume = 0;
   try { target.play().catch(() => {}); } catch {}
   const from = tracks.map((track) => ({track, start: track.volume}));
-  const began = performance.now(), duration = 760;
+  const began = performance.now(), duration = 1100;
   fadeTimer = setInterval(() => {
     const t = Math.min(1, (performance.now() - began) / duration);
     from.forEach(({track,start}) => {
-      track.volume = Math.max(0, Math.min(1, (track === target ? start + (audioSettings.master*audioSettings.bgm - start) * t : start * (1-t))));
+      const blend=t*t*(3-2*t);
+      track.volume = Math.max(0, Math.min(1, (track === target ? start + (musicVolume() - start) * blend : start * (1-blend))));
       if (t === 1 && track !== target) track.pause();
     });
     if (t === 1) clearInterval(fadeTimer);
@@ -77,19 +88,31 @@ function crossfadeCue(cue) {
   musicPlaying = true;
 }
 function setBgmCue(cue) { crossfadeCue(cue); }
+function sceneMusic(){
+  if(!state)return 'title';
+  if(state.prologueStep!=null&&!state.flags.prologueComplete)return prologue[state.prologueStep]?.cue||'awakening';
+  if(state.mainStage>=7)return 'ending';
+  if(state.injury)return 'awakening';
+  if(state.combat)return state.combat.id==='final'?'final':'battle';
+  if(state.tutorial==='encounter')return 'danger';
+  if(state.activeEventId?.startsWith('case-'))return 'mystery';
+  if(state.activeEventId==='story-epilogue')return 'awakening';
+  if(state.activeEventId==='story-final'||state.activeEventId==='story-midboss')return 'final';
+  return ({sect:'training',forest:'training',escort:'mystery',stockade:'mystery',inn:'awakening',clinic:'awakening',alley:'danger'})[state.location]||'market';
+}
 function stopAllMusic() { clearInterval(fadeTimer); activeTracks().forEach((track) => { track.pause(); track.volume = 0; }); musicPlaying = false; }
 function playSfx(name) {
   if (!audioSettings.sfx || !audioSettings.master || document.hidden) return;
-  const stamp=performance.now();if(name==='click'&&stamp-lastEffectAt<65)return;lastEffectAt=stamp;
+  const stamp=performance.now();if(['click','type'].includes(name)&&stamp-lastEffectAt<60)return;lastEffectAt=stamp;
   try {
     audioContext ||= new (window.AudioContext || window.webkitAudioContext)();
     if (audioContext.state === "suspended") audioContext.resume();
     const ctx=audioContext, now=ctx.currentTime, gain=ctx.createGain(), osc=ctx.createOscillator();
     if(!effectsBus){effectsBus=ctx.createDynamicsCompressor();effectsBus.threshold.value=-16;effectsBus.ratio.value=8;effectsBus.connect(ctx.destination);}
-    const presets={click:[540,720,.045,"sine"],draw:[260,740,.26,"sawtooth"],slash:[820,180,.19,"triangle"],impact:[115,62,.24,"sawtooth"],block:[430,250,.18,"triangle"],dodge:[300,980,.2,"sine"],skill:[240,920,.42,"sine"],reward:[520,1040,.32,"sine"],victory:[392,784,.75,"triangle"],dialog:[460,520,.07,"sine"]};
+    const presets={type:[160,120,.018,"triangle"],click:[540,720,.045,"sine"],draw:[260,740,.26,"sawtooth"],slash:[820,180,.19,"triangle"],impact:[115,62,.24,"sawtooth"],block:[430,250,.18,"triangle"],dodge:[300,980,.2,"sine"],skill:[240,920,.42,"sine"],reward:[520,1040,.32,"sine"],victory:[392,784,.75,"triangle"],dialog:[460,520,.07,"sine"]};
     const [a,b,dur,wave]=presets[name]||presets.click;
     osc.type=wave;osc.frequency.setValueAtTime(a,now);osc.frequency.exponentialRampToValueAtTime(Math.max(40,b),now+dur);
-    gain.gain.setValueAtTime(.0001,now);gain.gain.exponentialRampToValueAtTime(Math.max(.002,audioSettings.master*audioSettings.sfx*.13),now+.012);gain.gain.exponentialRampToValueAtTime(.0001,now+dur);
+    gain.gain.setValueAtTime(.0001,now);gain.gain.exponentialRampToValueAtTime(Math.max(.001,audioSettings.master*audioSettings.sfx*(name==='type' ? .024 : .13)),now+.008);gain.gain.exponentialRampToValueAtTime(.0001,now+dur);
     osc.connect(gain);gain.connect(effectsBus);osc.start(now);osc.stop(now+dur+.01);osc.onended=()=>{osc.disconnect();gain.disconnect();};
     if(name==="impact"||name==="block"){
       const length=Math.floor(ctx.sampleRate*.12), buffer=ctx.createBuffer(1,length,ctx.sampleRate), data=buffer.getChannelData(0);
@@ -108,16 +131,16 @@ function syncMusicButton() {
   button.setAttribute("aria-pressed", String(musicEnabled));
   button.setAttribute("aria-label", musicEnabled ? "배경 음악 끄기" : "배경 음악 켜기");
   button.title = musicEnabled ? "배경 음악 끄기" : "배경 음악 켜기";
-  button.textContent = musicEnabled ? "♫" : "♪";
+  button.innerHTML = icon('music');
   button.classList.toggle("music-off", !musicEnabled);
 }
 async function startMusic() {
-  if (!musicEnabled || document.hidden || musicStarting || (musicPlaying && activeCue && !activeCue.paused)) return;
+  if (!musicEnabled || desiredCue==='silence' || document.hidden || musicStarting || (musicPlaying && activeCue && !activeCue.paused)) return;
   musicStarting = true;
   try {
     const target = activeCue || mainBgm;
     activeCue = target;
-    target.volume = audioSettings.master*audioSettings.bgm;
+    target.volume = musicVolume();
     await target.play();
     musicPlaying = true;
   }
@@ -141,7 +164,7 @@ function makeInitial(name) {
     coin: 0, exp: 0, bonusAtk: 0, bonusDef: 0, gear: {weapon:null,armor:null}, items: {}, skills: [], sect: "아직 정하지 않음",
     mainStage: 0, flags: {}, trust: {}, rumors: 0, clues: [], done: [], lastDay: {}, day: 1,
     discoveredTerms: ["강호","무공","내공"], history: [], activeEventId: null, tutorial: "intro", combat: null,
-    pendingCombatChoice: null, injury: null, guide: preferences.guide, largeText: preferences.largeText, visited: ["market"], dialogueStep:0,
+    pendingCombatChoice: null, injury: null, guide: preferences.guide, largeText: preferences.largeText, visited: ["market"], dialogueStep:0,prologueStep:null,nameChosen:true,
     log: [{title:"낯선 장터", text:"정신을 차리니 낯선 장터였다. 가진 돈은 없고 배는 고프다.", day:1}]
   };
 }
@@ -225,7 +248,7 @@ function moveTo(id, {force=false, openEvent=null}={}) {
   }
   state.activeEventId = openEvent;
   state.dialogueStep=0;
-  setBgmCue(state.mainStage>=6&&id==="sect"?"final":id==="sect"&&state.mainStage>=4?"training":"ambient");
+
   save(); closeModal(); render();
 }
 function availableEvent(ev) {
@@ -310,27 +333,48 @@ function itemSprite(id, className="item-sprite") {
   const item = itemData[id];
   return item ? sprite(item.atlas||"items-atlas.png", item.sprite, item.cols||4, item.rows||4, className, item.name) : `<div class="${className}"></div>`;
 }
+function vnDialogue(speaker,text,action,label='다음',extra=''){
+  return `<div class="vn-dialogue" data-dialogue-action="${action}">${speaker?`<span class="speaker-chip">${esc(speaker)}</span>`:''}<p class="dialogue-text" data-typewriter>${esc(text)}</p>${extra||`<button class="vn-next" data-action="${action}" aria-label="${label}"><span aria-hidden="true">◆</span></button>`}</div>`;
+}
+function vnStage(art,content,header=''){
+  return `<section class="vn-stage ${art==='black'?'vn-dark':''}" data-art="${art}">${art==='black'?'':`<img class="vn-art" src="assets/vn/${art}.webp" alt="" width="1920" height="1080">`}${header?`<div class="vn-heading">${header}</div>`:''}${content}</section>`;
+}
+function renderPrologue(){
+  const line=prologue[state.prologueStep],text=line.text.replaceAll('{name}',state.name);
+  const nameForm=line.nameEntry?`<form id="reincarnationNameForm" class="vn-name-form"><label for="reincarnationName">이름</label><input id="reincarnationName" name="heroName" maxlength="12" required autocomplete="off" aria-label="노인에게 말할 이름"><button class="btn btn-primary" type="submit">이름을 말한다</button></form>`:'';
+  return vnStage(line.art,vnDialogue(line.speaker==='나레이션'?'':line.speaker,text,'advance-prologue','다음',nameForm));
+}
+function advancePrologue(){
+  if(state?.prologueStep==null||state.flags.prologueComplete)return;
+  if(finishTyping){finishTyping();return;}if(performance.now()<inputAfter)return;
+  if(prologue[state.prologueStep].nameEntry)return;
+  inputAfter=performance.now()+220;
+  if(state.prologueStep<prologue.length-1)state.prologueStep++;
+  else {state.flags.prologueComplete=true;state.prologueStep=null;state.tutorial='intro';addLog('다른 세상','회사를 나선 밤 트럭에 치였고, 이름 모를 강가에서 깨어났다. 만복이라는 노인을 따라 객잔으로 왔다.');}
+  save();render();
+}
+function chooseReincarnationName(name){
+  if(state?.prologueStep==null||!prologue[state.prologueStep]?.nameEntry)return;
+  const clean=name.trim().slice(0,12);if(!clean)return;
+  finishTyping?.();state.name=clean;state.nameChosen=true;state.prologueStep++;inputAfter=performance.now()+220;save();render();
+}
 function renderStart() {
   const saved = storedSave();
   document.getElementById("quickNav").hidden = true;
-  document.getElementById("app").innerHTML = `
+  return `
     <section class="welcome" aria-label="강호 첫걸음 게임 시작">
       <div class="welcome-content">
-        <div class="eyebrow">一飯之恩 · 밥 한 끼에서 시작된 인연</div>
+        <div class="title-emblem" aria-hidden="true">${icon('sword')}</div>
         <h1>강호<br><span>첫걸음</span></h1>
-        <p class="welcome-lead">주머니는 비었고, 손에는 목검 하나.<br>검보다 먼저 사람을 살피는 당신의 선택이<br>강호에 새로운 이름을 남깁니다.</p>
-        <div class="welcome-meta"><span class="tag">선택으로 쓰는 무협</span><span class="tag">세 번의 승부</span><span class="tag">하나의 완결된 여정</span></div>
         <div class="button-row">
           ${saved?.started ? `<button class="btn btn-primary" data-action="continue">이어 하기 <span aria-hidden="true">→</span></button>` : ''}
-          <button class="btn ${saved?'btn-quiet':'btn-primary'}" data-action="new-game">새 여정 시작 ${saved?'':'→'}</button>
+          <button class="btn ${saved?'btn-quiet':'btn-primary'}" data-action="new-game">처음부터</button>
         </div>
-        ${saved?`<p class="continue-caption">${esc(saved.name)} · ${esc(locationData[saved.location].name)} · ${saved.day}일째</p>`:''}
-        <div class="title-links"><button data-action="settings">설정</button><button data-action="save-panel">저장 관리</button><button data-panel="about">게임 안내 · 크레딧</button></div>
+        ${saved?`<p class="continue-caption">${saved.prologueStep!=null&&!saved.flags.prologueComplete?'서장':`${esc(saved.name)} · ${saved.day}일째`}</p>`:''}
+        <div class="title-links"><button data-action="settings">설정</button><button data-action="save-panel">저장</button><button data-panel="about">크레딧</button></div>
       </div>
-      <div class="title-art" aria-hidden="true"><div class="title-moon"></div><span class="title-calligraphy">江<br>湖<br>初<br>行</span><img src="assets/remaster/traveler-standing.webp" alt="" width="1024" height="1536"><span class="title-seal">첫<br>걸음</span></div>
-      <div class="welcome-foot">강호 첫걸음 · 이야기의 끝에서 당신의 선택을 기억합니다</div>
-    </section>
-    <p class="title-note">진행은 이 브라우저에 자동 저장됩니다 · 마우스 또는 키보드로 플레이</p>`;
+      <span class="title-seal" aria-hidden="true">江<br>湖</span>
+    </section>`;
 }
 function renderSidebar() {
   const st = stats(), weapon = state.gear.weapon ? itemData[state.gear.weapon] : null, armor = state.gear.armor ? itemData[state.gear.armor] : null;
@@ -375,7 +419,7 @@ function renderEventScene(ev) {
   const person = npcRecord(ev.npc);
   const standing = ev.npc === "bandit-master" ? "bandit-standing" : ev.npc === "mentor" ? "mentor-standing" : ev.npc === "midboss" ? "midboss-standing" : ev.npc === "grandmaster" ? "grandmaster-standing" : null;
   const figure = standing ? `<img class="event-standing" src="assets/remaster/${standing}.webp" alt="${esc(person?.name||"강호 사람")} 전신 모습">` : "";
-  const intro = `<div class="scene-heading"><div><h2>${esc(ev.title)}</h2><p>${esc(person?.name||"누군가")} · ${esc(person?.role||"강호 사람")}</p></div><span class="scene-badge">${esc(ev.category)}</span></div>
+  const intro = `${sceneIllustrations[ev.id]?`<img class="event-cg" src="assets/vn/${sceneIllustrations[ev.id]}.webp" alt="" width="1920" height="1080">`:""}<div class="scene-heading"><div><h2>${esc(ev.title)}</h2><p>${esc(person?.name||"누군가")} · ${esc(person?.role||"강호 사람")}</p></div><span class="scene-badge">${esc(ev.category)}</span></div>
     ${figure?`<div class="event-portrait-stage">${figure}<span>${esc(person?.name||"")}</span></div>`:""}
     <div class="story-box">${person&&!beats?`<p><strong>${esc(person.name)}:</strong> ${esc(person.hello)} ${esc(relationshipLine(person))}</p>`:""}<p>${esc(ev.intro)}</p></div>
     <div class="event-actions">${ev.choices.map((c,i)=>`<button class="choice-button" data-action="choose-event" data-index="${i}" ${c.effects.coin<0&&state.coin < -c.effects.coin?"disabled":""}><span class="choice-num">0${i+1}</span><span class="choice-title">${esc(c.label)}</span>${state.guide?`<span class="choice-hint">${esc(c.hint)}</span>`:""}</button>`).join("")}</div>
@@ -384,8 +428,7 @@ function renderEventScene(ev) {
 }
 function renderChapterDialogue(ev,beats) {
   const step=Math.min(beats.length-1,state.dialogueStep||0), [speaker,text]=beats[step];
-  const person=npcRecord(ev.npc), figure={mentor:'mentor',midboss:'midboss',grandmaster:'grandmaster','bandit-master':'bandit'}[ev.npc];
-  return `<section class="panel chapter-dialogue"><div class="scene-heading"><div><p>여정 ${questInfo().step} · ${step+1} / ${beats.length}</p><h2>${esc(ev.title)}</h2></div><button class="btn btn-small" data-action="skip-dialogue">선택으로 건너뛰기</button></div><div class="chapter-stage">${figure?`<img class="chapter-figure" src="assets/remaster/${figure}-standing.webp" width="1024" height="1536" alt="${esc(person.name)}">`:portrait(person?.id,'chapter-portrait')}<div class="chapter-stage-caption">${esc(locationData[state.location].name)}<small>${esc(person?.role||'강호의 이야기')}</small></div></div><div class="chapter-speech"><span class="speaker-name">${esc(speaker==='나'?state.name:speaker)}</span><p class="dialogue-text" data-typewriter>${esc(text)}</p><div class="dialogue-footer"><small>한 번 누르면 문장 완성 · 다시 누르면 다음 대사</small><button class="btn btn-primary" data-action="advance-dialogue">${step===beats.length-1?'선택하기':'다음'} →</button></div></div></section>`;
+  return vnStage(sceneIllustrations[ev.id]||'awakening',vnDialogue(speaker==='나'?state.name:speaker==='나레이션'?'':speaker,text,'advance-dialogue',step===beats.length-1?'선택하기':'다음'),`<h2>${esc(ev.title)}</h2><button class="vn-skip" data-action="skip-dialogue">건너뛰기</button>`);
 }
 function advanceDialogue(){
   if(finishTyping){finishTyping();return;}if(performance.now()<inputAfter)return;
@@ -451,12 +494,11 @@ function renderIntro() {
     {label:"장터를 둘러보며 필요한 것을 묻는다",hint:"은전 2닢 · 상인과 인사",coin:2,trust:{merchant:1},rumors:1,result:"장터의 길을 익히고 은전 두 닢을 받았다. 상인은 작은 소동이 날 수 있다고 귀띔했다."},
     {label:"객잔 앞 수상한 소문을 따라간다",hint:"은전 1닢 · 소문 한 조각",coin:1,rumors:1,flags:{heardFirstRumor:true},result:"사람들이 골목에서 시비가 있었다고 말했다. 길을 알려 준 아이가 은전 한 닢을 건넸다."}
   ];
-  const content = `<section class="panel scene-card opening-scene"><div class="scene-heading"><div><h2>첫 끼니를 어떻게 마련할까?</h2><p>북쪽 장터 · 솔바람 객잔 앞</p></div><span class="scene-badge">여정의 시작</span></div>
-    <div class="story-box"><p>낯선 장터에서 눈을 떴다. 무림인들이 살아가는 세상, <strong>강호</strong>. 주머니는 비었고 배가 고프다.</p><p>객잔 주인이 손짓한다. “일손을 보태면 따뜻한 밥을 주지.” 그때, 뒷골목에서 다투는 소리가 들린다.</p></div>
+  const content = `<section class="vn-choice-board opening-scene"><div class="scene-heading"><div><h2>첫 끼니를 어떻게 마련할까?</h2></div></div>
+    <p class="choice-prompt">만복이 주방을 가리켰다. “일손을 보태면 따뜻한 밥을 주지.” 문밖에선 다투는 소리가 들린다.</p>
     <div class="event-actions">${choices.map((c,i)=>`<button class="choice-button" data-action="opening-choice" data-index="${i}"><span class="choice-num">0${i+1}</span><span class="choice-title">${esc(c.label)}</span>${state.guide?`<span class="choice-hint">${esc(c.hint)}</span>`:""}</button>`).join("")}</div>
-    <div class="scene-foot"><small>첫 선택은 작은 보상으로 이어집니다. 전투에서 지더라도 이야기는 계속돼요.</small><button class="btn btn-small" data-panel="glossary">용어 보기</button></div>
   </section>`;
-  return renderGameFrame(content,{hero:true});
+  return vnStage('awakening',content);
 }
 function isHeavy(c) { return c.round % (c.id==="final"?2:3)===(c.id==="final"?1:2); }
 function combatSpec(id) {
@@ -497,8 +539,8 @@ function renderCombat() {
   const heavy=isHeavy(c);
   const disabled=c.turnPending?"disabled":"";
   const content=`<section class="combat-shell combat-screen ${c.turnPending?"combat-resolving":""}">
-    <div class="combat-title"><div><span>DUEL · ${c.round+1} 번째 공방</span><h2>${c.id==="intro"?"골목의 첫 승부":c.id==="midboss"?"흰 옷 검객의 시험":"천하제일 비무"}</h2></div><span class="scene-badge">${c.round+1} / 무공 겨루기</span></div>
-    <div class="battlefield ${c.turnPending&&["attack","skill"].includes(c.lastMove)?"player-strike":""}">
+    <div class="combat-title"><div><span>${c.round+1}번째 공방</span><h2>${c.id==="intro"?"골목의 첫 승부":c.id==="midboss"?"흰 옷 검객의 시험":"천하제일 비무"}</h2></div><span class="scene-badge">${c.round+1} / 무공 겨루기</span></div>
+    <div style="--battle-art:url('assets/vn/${c.id==="intro"?"alley":"duel"}.webp')" class="battlefield ${c.turnPending&&["attack","skill"].includes(c.lastMove)?"player-strike":""}">
       <div class="fighter fighter-player"><img class="battle-figure" src="assets/remaster/traveler-standing.webp" alt="${esc(state.name)}"><div class="fighter-name">${esc(state.name)} <small>나그네</small></div></div>
       <div class="battle-vs">VS</div>
       <div class="fighter fighter-enemy ${c.damageFloat?"enemy-stagger":""}"><img class="battle-figure" src="assets/remaster/${spec.figure}.webp" alt="${esc(c.enemy)}">${c.damageFloat?`<span class="damage-number">${c.damageFloat}</span>`:""}<div class="fighter-name">${esc(c.enemy)} <small>${esc(spec.role)}</small></div></div>
@@ -510,12 +552,12 @@ function renderCombat() {
     <div class="combat-console"><div class="combat-console-head"><div><strong>무엇을 하시겠습니까?</strong><small>한 차례에 하나의 행동을 고르세요.</small></div><span>차례 ${c.round+1}</span></div>
       ${state.skills.length>1?`<label class="combat-style">사용할 무공 <select data-combat-style aria-label="사용할 무공" ${disabled}>${state.skills.map(s=>`<option value="${s}" ${s===style?'selected':''}>${{sword:'기초 검식',fist:'기초 권법',lightness:'가벼운 발놀림'}[s]}</option>`).join('')}</select></label>`:''}
       <div class="combat-actions">
-        <button class="combat-action action-primary" data-action="combat-move" data-move="attack" ${disabled}><span>⚔</span><strong>기본 공격</strong><small>피해 ${st.atk+(c.opening||0)}+</small></button>
-        <button class="combat-action ${heavy?'recommended-action':''}" data-action="combat-move" data-move="defend" ${disabled}><span>◈</span><strong>방어</strong><small>내공 +3 · 피해 감소</small></button>
-        <button class="combat-action" data-action="combat-move" data-move="dodge" ${disabled||state.qi<2?"disabled":""}><span>〰</span><strong>회피</strong><small>내공 −2 · 반격 +3</small></button>
-        <button class="combat-action" data-action="combat-move" data-move="skill" ${disabled||!state.skills.length||state.qi<8?"disabled":""}><span>✦</span><strong>${esc(skillName)}</strong><small>${esc(skillPreview)}</small></button>
-        <button class="combat-action" data-action="combat-items" ${disabled}><span>囊</span><strong>회복 물품</strong><small>가방에서 선택</small></button>
-        <button class="combat-action" data-action="combat-move" data-move="flee" ${disabled}><span>↗</span><strong>물러서기</strong><small>정비 후 다시 도전</small></button>
+        <button class="combat-action action-primary" data-action="combat-move" data-move="attack" ${disabled}><span>${icon("sword")}</span><strong>기본 공격</strong><small>피해 ${st.atk+(c.opening||0)}+</small></button>
+        <button class="combat-action ${heavy?'recommended-action':''}" data-action="combat-move" data-move="defend" ${disabled}><span>${icon("shield")}</span><strong>방어</strong><small>내공 +3 · 피해 감소</small></button>
+        <button class="combat-action" data-action="combat-move" data-move="dodge" ${disabled||state.qi<2?"disabled":""}><span>${icon("wind")}</span><strong>회피</strong><small>내공 −2 · 반격 +3</small></button>
+        <button class="combat-action" data-action="combat-move" data-move="skill" ${disabled||!state.skills.length||state.qi<8?"disabled":""}><span>${icon("flame")}</span><strong>${esc(skillName)}</strong><small>${esc(skillPreview)}</small></button>
+        <button class="combat-action" data-action="combat-items" ${disabled}><span>${icon("bag")}</span><strong>회복 물품</strong><small>가방에서 선택</small></button>
+        <button class="combat-action" data-action="combat-move" data-move="flee" ${disabled}><span>${icon("exit")}</span><strong>물러서기</strong><small>정비 후 다시 도전</small></button>
       </div><p class="combat-tip">${c.id==="intro"?"상대의 어깨가 먼저 움직입니다. 눈을 보고 다음 수를 골라 보세요.":"상대가 크게 칼을 들 때 방어하거나 회피하면 피해를 줄일 수 있습니다."}</p>
     </div>
   </section>`;
@@ -542,15 +584,18 @@ function renderEnding() {
   const content=`<section class="panel scene-card final-ending"><div class="ending-heading"><span>THE NAME OF JIANGHU</span><h2>천하제일인</h2><p>${esc(state.name)} · 새로운 강호의 이름</p></div><div class="ending-stage"><img src="assets/remaster/traveler-standing.webp" alt="천하제일인이 된 ${esc(state.name)}"><div class="ending-seal">天下<br>第一</div></div><div class="story-box ending-copy"><p>구름 위 대련장에 검성이 천천히 검을 거둔다. ${esc(path)} 마지막 초식을 넘어섰다.</p><p>${esc(bond)} 사람들은 저마다 살아갈 길을 찾았고, 강호는 이제 네 이름을 기억한다.</p><p>${state.flags.assisted?"사부의 조언을 빌렸지만 마지막 한 수는 네 손으로 완성했다. ":""}첫날엔 밥값도, 내공도 몰랐다. 그때 골목에서 쥐었던 목검 한 자루가 오늘의 너를 만들었다.</p></div><div class="ending-stats"><span>${state.day}일의 강호행</span><span>${state.done.length}개의 사건 해결</span><span>${state.visited.length}곳 방문</span><span>${state.skills.length}개의 무공</span></div><details class="ending-letters"><summary>강호에서 도착한 편지</summary>${endingLetters(state).map(([name,text])=>`<article><strong>${esc(name)}</strong><p>${esc(text)}</p></article>`).join("")}</details><div class="ending-actions"><button class="btn btn-primary" data-action="log">여정의 기록 보기</button><button class="btn btn-light" data-action="new-game">새로운 여정</button></div><p class="ending-foot">一劍江湖 · 한 자루의 목검으로 시작한 강호행</p></section>`;
   return renderGameFrame(content);
 }
-function startTypewriter(){
+function startTypewriter(delay=0){
   if(typingFrame!=null)cancelAnimationFrame(typingFrame);typingFrame=null;finishTyping=null;
   const node=document.querySelector('#app [data-typewriter]');
-  if(!node||!preferences.textSpeed||preferences.reducedMotion||window.matchMedia('(prefers-reduced-motion: reduce)').matches)return;
-  const text=node.textContent,letters=Array.from(text),started=performance.now();
-  node.innerHTML=`<span class="tw-full">${esc(text)}</span><span class="tw-visible" aria-hidden="true"></span>`;
+  if(!node||!preferences.textSpeed)return;
+  const text=node.textContent,letters=Array.from(text),started=performance.now()+delay,stage=node.closest('.vn-stage');
+  stage?.classList.add('is-typing');
+  let elapsed=0,index=0;
+  const offsets=letters.map(letter=>{elapsed+=preferences.textSpeed+(/[.!?。？！]/.test(letter)?115:/[,，…]/.test(letter)?45:0);return elapsed;});
+  node.innerHTML=`<span class="tw-full">${esc(text)}</span><span class="tw-visible" aria-hidden="true">${letters.map(letter=>`<span class="tw-char">${esc(letter)}</span>`).join('')}</span>`;
   const visible=node.querySelector('.tw-visible');
-  finishTyping=()=>{if(typingFrame!=null)cancelAnimationFrame(typingFrame);node.textContent=text;typingFrame=null;finishTyping=null;inputAfter=performance.now()+100;};
-  const tick=()=>{if(!node.isConnected){finishTyping=null;return;}const count=Math.min(letters.length,Math.floor((performance.now()-started)/preferences.textSpeed));visible.textContent=letters.slice(0,count).join('');if(count>=letters.length){finishTyping();return;}typingFrame=requestAnimationFrame(tick);};
+  finishTyping=()=>{if(typingFrame!=null)cancelAnimationFrame(typingFrame);node.textContent=text;stage?.classList.remove('is-typing');typingFrame=null;finishTyping=null;};
+  const tick=()=>{if(!node.isConnected){finishTyping=null;return;}const now=performance.now()-started;while(index<letters.length&&offsets[index]<=now){visible.children[index]?.classList.add('shown');if(index%3===0&&!/\s/.test(letters[index]))playSfx('type');index++;}if(index>=letters.length){finishTyping();return;}typingFrame=requestAnimationFrame(tick);};
   typingFrame=requestAnimationFrame(tick);
 }
 function stageMarkup(root,markup){
@@ -562,9 +607,14 @@ function stageMarkup(root,markup){
   }
 }
 function render() {
+  const revision=++renderRevision;
   const root=document.getElementById("app"), nav=document.getElementById("quickNav");
-  const sceneKey=!state?"welcome":state.combat?`combat-${state.combat.id}`:state.injury?`injury-${state.injury}`:state.result?`result-${state.result.title}`:state.activeEventId?`${state.activeEventId}-${state.dialogueStep||0}`:`${state.tutorial}-${state.mainStage}-${state.location}-${state.encounterStep??""}`;
+  const inPrologue=state?.prologueStep!=null&&!state.flags.prologueComplete;
+  const sceneKey=!state?"welcome":inPrologue?`prologue-${state.prologueStep}`:state.combat?`combat-${state.combat.id}`:state.injury?`injury-${state.injury}`:state.result?`result-${state.result.title}`:state.activeEventId?`${state.activeEventId}-${state.dialogueStep||0}`:`${state.tutorial}-${state.mainStage}-${state.location}-${state.encounterStep??""}`;
   const previousScene=root.dataset.scene,changed=previousScene!==sceneKey, active=document.activeElement;
+  const cinematicKey=inPrologue?'prologue-'+prologue[state.prologueStep].art:state?.activeEventId?state.activeEventId+'-'+(chapterDialogue[state.activeEventId]&&(state.dialogueStep||0)<chapterDialogue[state.activeEventId].length?'dialogue':'choice'):state?.tutorial==='encounter'?'encounter':sceneKey;
+  const transitionScene=changed&&Boolean(previousScene)&&root.dataset.visual!==cinematicKey;
+  root.dataset.visual=cinematicKey;
   if(active?.dataset?.move)lastCombatFocus=active.dataset.move;
   const focusMove=state?.combat?lastCombatFocus:null;
   const styleFocus=active?.hasAttribute?.('data-combat-style');
@@ -572,16 +622,18 @@ function render() {
   root.dataset.scene=sceneKey;
   document.body.classList.toggle("large-text",preferences.largeText);
   document.body.classList.toggle('reduce-motion',preferences.reducedMotion);
-  document.body.dataset.scene=state?.combat?"combat":state?.tutorial||"welcome";
+  document.body.dataset.scene=inPrologue?'prologue':state?.combat?"combat":state?.tutorial||"welcome";
+  setBgmCue(sceneMusic());
   document.getElementById('saveStatus').hidden=!state;
   renderBackdrop();
   let markup;
-  if (!state?.combat && (state?.tutorial === "encounter" || state?.encounterStep != null)) {
+  if(inPrologue){nav.hidden=true;markup=renderPrologue();}
+  else if (!state?.combat && (state?.tutorial === "encounter" || state?.encounterStep != null)) {
     nav.hidden = true;
     markup=renderEncounter();
-  } else if (!state) { renderStart(); }
+  } else if (!state) { markup=renderStart(); }
   else {
-    nav.hidden=Boolean(state.combat);
+    nav.hidden=Boolean(state.combat||state.tutorial==='intro'||state.activeEventId&&chapterDialogue[state.activeEventId]&&(state.dialogueStep||0)<chapterDialogue[state.activeEventId].length);
     if (state.tutorial==="intro") markup=renderIntro();
     else if (state.injury) markup=renderInjury();
     else if (state.tutorial==="combat" || state.combat) markup=renderCombat();
@@ -590,45 +642,40 @@ function render() {
     else if (state.mainStage>=7) markup=renderEnding();
     else markup=renderFreeScene();
   }
+  const commit=()=>{
+  if(revision!==renderRevision)return;
   if(markup)stageMarkup(root,markup);
+  if(changed)startTypewriter(transitionScene&&!preferences.reducedMotion?450:0);
+  if(transitionScene&&!preferences.reducedMotion)root.firstElementChild?.classList.add('scene-arrive');
+  root.inert=!document.getElementById('modalBackdrop').hidden;
   if(drawerOpen&&!changed){const drawer=root.querySelector('.journey-drawer');if(drawer)drawer.open=true;}
   if(!changed&&document.getElementById('modalBackdrop').hidden){if(styleFocus)root.querySelector('[data-combat-style]')?.focus({preventScroll:true});else if(focusMove)root.querySelector(`[data-move="${focusMove}"]:not(:disabled)`)?.focus({preventScroll:true});}
   if(changed)requestAnimationFrame(()=>{
     if(root.dataset.scene!==sceneKey)return;
-    if(!(state?.activeEventId&&previousScene?.startsWith(state.activeEventId+'-'))&&!(state?.tutorial==='encounter'&&previousScene?.startsWith('encounter-')))window.scrollTo({top:0,behavior:'instant'});
-    if(document.getElementById('modalBackdrop').hidden){const focus=root.querySelector('[data-action="advance-dialogue"],[data-action="advance-encounter"],h2,h1');if(focus){if(focus.tagName!=='BUTTON')focus.tabIndex=-1;focus.focus({preventScroll:true});}}
-    startTypewriter();
+    if(!(state?.activeEventId&&previousScene?.startsWith(state.activeEventId+'-'))&&!(state?.tutorial==='encounter'&&previousScene?.startsWith('encounter-'))&&!inPrologue)window.scrollTo({top:0,behavior:'instant'});
+    if(document.getElementById('modalBackdrop').hidden){const focus=root.querySelector('[data-action="advance-prologue"],[data-action="advance-dialogue"],[data-action="advance-encounter"],h2,h1');if(focus){if(focus.tagName!=='BUTTON')focus.tabIndex=-1;focus.focus({preventScroll:true});}}
   });
+  };
+  commit();
 }
 
 function renderBackdrop() {
-  const host = document.getElementById("worldBackdrop");
-  if (!host) return;
-  const locationId = state?.location || "market";
-  const portraitMode = window.matchMedia?.("(max-aspect-ratio: 3/4)").matches;
-  const isFinal = state?.combat?.id === "final" || (state?.mainStage >= 6 && locationId === "sect");
-  const backdropKey=`${locationId}-${isFinal}-${portraitMode}`;
-  if(host.dataset.scene===backdropKey){const tile=host.querySelector('.world-scene-window');if(tile){const width=Math.max(window.innerWidth,window.innerHeight*2/3);tile.style.width=width+'px';tile.style.height=width*1.5+'px';}return;}
-  host.dataset.scene=backdropKey;
-  const sceneArt = isFinal
-    ? (portraitMode ? "assets/remaster/final-mobile.webp" : "assets/remaster/final-wide.webp")
-    : locationId === "sect"
-      ? (portraitMode ? "assets/remaster/training-mobile.webp" : "assets/remaster/training-wide.webp")
-    : locationId === "alley"
-      ? (portraitMode ? "assets/remaster/alley-mobile.webp" : "assets/remaster/alley-wide.webp")
-      : locationId === "market"
-        ? "assets/market-hero.png"
-      : null;
-  if (sceneArt) {
-    const apply=()=>{if(host.dataset.scene===backdropKey)host.innerHTML=`<div class="world-hero-image" style="background-image:url('${sceneArt}')"></div><div class="world-scrim"></div>`;};
-    if(typeof Image!=='undefined')preloadImage(sceneArt).then(apply);else apply();
-    return;
-  }
-  const index = locationData[locationId]?.image ?? 0;
-  const col = index % 4, row = Math.floor(index / 4);
-  const tileWidth = Math.max(window.innerWidth, window.innerHeight * 2 / 3);
-  const tileHeight = tileWidth * 1.5;
-  host.innerHTML = `<div class="world-scene-window" style="width:${tileWidth}px;height:${tileHeight}px"><img src="assets/locations-atlas.png" alt="" style="left:${-col*100}%;top:${-row*100}%"></div><div class="world-scrim"></div>`;
+  const host=document.getElementById('worldBackdrop');if(!host)return;
+  const line=state?.prologueStep!=null&&!state.flags.prologueComplete?prologue[state.prologueStep]:null;
+  const art=line?.art||(!state?'mountain':state.mainStage>=7||state.combat?.id!=='intro'&&state.combat?'duel':state.combat||state.tutorial==='encounter'?'alley':sceneIllustrations[state.activeEventId]||({sect:'mountain',forest:'caravan',escort:'caravan',stockade:'caravan',alley:'alley'})[state.location]||'awakening');
+  if(host.dataset.scene===art)return;host.dataset.scene=art;
+  const src=art==='black'?null:'assets/vn/'+art+'.webp';
+  const apply=()=>{
+    if(host.dataset.scene!==art)return;
+    if(typeof document.createElement!=='function'){host.innerHTML='<div class="world-layer visible"></div>';return;}
+    const previous=[...host.querySelectorAll('.world-layer')];
+    const layer=document.createElement('div');layer.className='world-layer';
+    if(src)layer.style.backgroundImage='url("'+src+'")';else layer.style.backgroundColor='#03040a';
+    layer.innerHTML='<div class="world-scrim"></div>';host.append(layer);
+    requestAnimationFrame(()=>{layer.classList.add('visible');previous.forEach(old=>old.classList.remove('visible'));});
+    setTimeout(()=>previous.forEach(old=>old.remove()),900);
+  };
+  if(src&&typeof Image!=='undefined')preloadImage(src).then(apply);else apply();
 }
 
 function renderEncounter() {
@@ -641,24 +688,11 @@ function renderEncounter() {
     {speaker:"강도", text:"목검 하나로 날 상대하겠다고? 좋아, 어디 한번 덤벼 봐!"}
   ];
   const line = lines[step];
-  return `<section class="encounter-screen" aria-live="polite">
-    <div class="cinematic-kicker"><span>ACT I · 북쪽 장터 뒷골목</span><span>${step+1} / ${lines.length}</span></div>
-    <div class="encounter-stage">
-      <img class="standing-figure protagonist-figure ${step===0?"enter-left":""}" src="assets/remaster/traveler-standing.webp" alt="목검을 든 ${esc(state.name)}">
-      <img class="standing-figure bandit-figure ${step===0?"enter-right":""}" src="assets/remaster/bandit-standing.webp" alt="길을 막아선 강도">
-      <span class="scene-caption">장터의 불빛이 골목 끝으로 멀어진다</span>
-      ${step===1||step===4?`<div class="speech-burst">${step===1?"흥":"!"}</div>`:""}
-    </div>
-    <div class="dialogue-panel encounter-dialogue">
-      <div class="speaker-name">${esc(line.speaker)}</div>
-      <p class="dialogue-text" data-typewriter>${esc(line.text)}</p>
-      <button class="btn btn-primary dialogue-advance" data-action="advance-encounter">${step===lines.length-1?"전투 시작":"다음"} <span aria-hidden="true">→</span></button>
-    </div>
-  </section>`;
+  return vnStage('alley',vnDialogue(line.speaker==='나레이션'?'':line.speaker,line.text,'advance-encounter',step===lines.length-1?'전투 시작':'다음'));
 }
 
 function openingChoice(index) {
-  if(state.tutorial!=="intro")return;
+  if(state.tutorial!=="intro"||state.prologueStep!=null)return;
   const options=[
     {coin:3,hp:4,trust:{innkeeper:1},text:"설거지와 장작 나르기를 거들었다. 주인은 따뜻한 밥과 은전 세 닢을 건넸다."},
     {coin:2,trust:{merchant:1},rumor:1,text:"장터의 길을 익히고 은전 두 닢을 받았다. 상인은 작은 소동이 날 수 있다고 귀띔했다."},
@@ -675,7 +709,7 @@ function openingChoice(index) {
   state.tutorial="encounter";
   state.encounterStep=0;
   state.combat=null;
-  setBgmCue("ambient");
+
   save();render();
 }
 function advanceEncounter() {
@@ -694,7 +728,7 @@ function winCombat() {
   addLog(id==="intro"?"골목 소동을 막았다":id==="midboss"?"흰 옷 검객을 물리쳤다":"검성과의 비무에서 승리했다.",id==="intro"?"상대의 움직임을 살피고 싸움을 끝냈다.":id==="midboss"?"발과 어깨를 읽고 배운 동작으로 검객의 기세를 꺾었다.":"배운 호흡과 곁에서 응원한 이들의 마음으로 검성의 마지막 초식을 넘어섰다.");
   state.coin+=id==="intro"?2:id==="midboss"?4:8;
   state.combat=null;
-  if(id==="intro") { state.tutorial="reward"; state.injury=null; setBgmCue("ambient"); }
+  if(id==="intro") { state.tutorial="reward"; state.injury=null;  }
   else {
     const pending=state.pendingCombatChoice;
     state.pendingCombatChoice=null;
@@ -713,7 +747,7 @@ function winCombat() {
 function loseCombat(reason="") {
   const id=state.combat?.id || state.injury || "intro";
   addLog("잠시 물러나다",reason||"상대의 움직임이 생각보다 빨랐다. 주변 사람이 치료를 돕는다.");
-  state.combat=null; state.injury=id; state.hp=1; setBgmCue("ambient"); save(); render();
+  state.combat=null; state.injury=id; state.hp=1;  save(); render();
 }
 function completeCombatAction() {
   const c=state?.combat;if(!c||!c.turnPending)return;
@@ -780,7 +814,7 @@ function retryCombat() {
 }
 function acceptHelp() {
   if(state.injury==="intro") {
-    state.injury=null;state.hp=state.maxHp;state.qi=state.maxQi;state.tutorial="reward";setBgmCue("ambient");
+    state.injury=null;state.hp=state.maxHp;state.qi=state.maxQi;state.tutorial="reward";
     state.coin+=1; addLog("도움을 받아 다시 일어나다","주인장과 표사가 싸움을 말려 주었다. 걱정 말라며 작은 보상도 보탰다.");
     save();render();return;
   }
@@ -888,7 +922,7 @@ function reviewLoad(record){
 function resumeGame(data){
   importGeneration++;state=data;state.guide=preferences.guide;state.largeText=preferences.largeText;
   storageConflict=false;try{observedSave=localStorage.getItem(SAVE_KEY);}catch{}
-  activeCue=null;setBgmCue(state.combat?.id==='final'?'final':state.combat?'battle':state.mainStage>=7?'training':state.location==='sect'&&state.mainStage>=4?'training':'ambient');
+  activeCue=null;
   closeModal();render();
 }
 function saveSlot(n,confirmed=false){
@@ -901,14 +935,14 @@ function showLog() {
 }
 function showSettings() {
   const speed=preferences.textSpeed;
-  showModal(`${panelTitle('설정', '읽기와 소리를 편안한 속도로 맞추세요. 설정은 새 여정에도 유지됩니다.')}<div class="settings-row"><span><strong>선택지 도움말</strong><br><small>행동의 예상 결과 표시</small></span><button class="switch ${preferences.guide?'on':''}" data-action="toggle-guide" role="switch" aria-checked="${preferences.guide}" aria-label="선택지 도움말"><span></span></button></div><div class="settings-row"><span><strong>큰 글씨</strong><br><small>본문과 선택지 확대</small></span><button class="switch ${preferences.largeText?'on':''}" data-action="toggle-text" role="switch" aria-checked="${preferences.largeText}" aria-label="큰 글씨"><span></span></button></div><div class="settings-row"><span><strong>움직임 줄이기</strong><br><small>화면 전환과 전투 애니메이션 감소</small></span><button class="switch ${preferences.reducedMotion?'on':''}" data-action="toggle-motion" role="switch" aria-checked="${preferences.reducedMotion}" aria-label="움직임 줄이기"><span></span></button></div><label class="reading-speed"><strong>대사 표시 속도</strong><select data-setting="textSpeed" aria-label="대사 표시 속도"><option value="24" ${speed===24?'selected':''}>보통</option><option value="45" ${speed===45?'selected':''}>느리게</option><option value="0" ${speed===0?'selected':''}>바로 표시</option></select></label>${[['master','전체 음량'],['bgm','배경 음악'],['sfx','효과음']].map(([key,label])=>`<label class="audio-slider"><span>${label} <b>${Math.round(audioSettings[key]*100)}%</b></span><input type="range" min="0" max="100" value="${Math.round(audioSettings[key]*100)}" data-audio="${key}" aria-label="${label}"></label>`).join('')}<div class="button-row"><button class="btn btn-small" data-action="test-sound">효과음 들어 보기</button><button class="btn btn-small" data-action="fullscreen">전체 화면 전환</button></div><p class="settings-help">대사: Enter / Space · 전투: 숫자 1–6 · 메뉴 닫기: Esc<br>탭을 벗어나거나 메뉴를 열면 전투의 진행이 잠시 멈춥니다.</p>`);
+  showModal(`${panelTitle('설정', '읽기와 소리를 편안한 속도로 맞추세요. 설정은 새 여정에도 유지됩니다.')}<div class="settings-row"><span><strong>선택지 도움말</strong><br><small>행동의 예상 결과 표시</small></span><button class="switch ${preferences.guide?'on':''}" data-action="toggle-guide" role="switch" aria-checked="${preferences.guide}" aria-label="선택지 도움말"><span></span></button></div><div class="settings-row"><span><strong>큰 글씨</strong><br><small>본문과 선택지 확대</small></span><button class="switch ${preferences.largeText?'on':''}" data-action="toggle-text" role="switch" aria-checked="${preferences.largeText}" aria-label="큰 글씨"><span></span></button></div><div class="settings-row"><span><strong>움직임 줄이기</strong><br><small>화면 전환과 전투 애니메이션 감소</small></span><button class="switch ${preferences.reducedMotion?'on':''}" data-action="toggle-motion" role="switch" aria-checked="${preferences.reducedMotion}" aria-label="움직임 줄이기"><span></span></button></div><label class="reading-speed"><strong>대사 표시 속도</strong><select data-setting="textSpeed" aria-label="대사 표시 속도"><option value="18" ${speed===18?'selected':''}>빠르게</option><option value="32" ${speed===32?'selected':''}>보통</option><option value="0" ${speed===0?'selected':''}>바로 표시</option></select></label>${[['master','전체 음량'],['bgm','배경 음악'],['sfx','효과음']].map(([key,label])=>`<label class="audio-slider"><span>${label} <b>${Math.round(audioSettings[key]*100)}%</b></span><input type="range" min="0" max="100" value="${Math.round(audioSettings[key]*100)}" data-audio="${key}" aria-label="${label}"></label>`).join('')}<div class="button-row"><button class="btn btn-small" data-action="test-sound">효과음 들어 보기</button><button class="btn btn-small" data-action="fullscreen">전체 화면 전환</button></div><p class="settings-help">대사: Enter / Space · 전투: 숫자 1–6 · 메뉴 닫기: Esc<br>탭을 벗어나거나 메뉴를 열면 전투의 진행이 잠시 멈춥니다.</p>`);
 }
 function showAbout() {
-  showModal(`${panelTitle("게임 안내", "낯선 말은 처음 나올 때만 쉽게 설명합니다.")}<div class="glossary-list"><article class="glossary-entry"><strong>무엇을 하면 되나요?</strong><p>장소를 둘러보고 사건을 고른 뒤, 두세 가지 행동 중 하나를 선택합니다. 선택에 따라 돈, 체력, 인물의 신뢰가 달라질 수 있습니다.</p></article><article class="glossary-entry"><strong>전투가 걱정돼요.</strong><p>공격은 피해를 주고, 방어는 다음 피해를 줄이며, 회피는 내공 2를 쓰고 다음 공격에 힘을 더합니다. 패배해도 치료와 재도전이 가능합니다.</p></article><article class="glossary-entry"><strong>저장은 어디에 되나요?</strong><p>진행 상태는 현재 브라우저에 자동 저장됩니다. 저장 메뉴에서 백업 파일로 내보내거나 다시 불러올 수 있습니다.</p></article><article class="glossary-entry"><strong>무협 단어가 어려워요.</strong><p>상단의 물음표 또는 아래 수첩 버튼을 눌러 이미 만난 용어를 언제든 확인하세요.</p></article><article class="glossary-entry"><strong>음악 크레딧</strong><p>Asianoriental2 — Tozan (CC0). Samurai Nights — Majadroid / Maik Hoffmann (CC-BY 4.0). 원곡의 전투·Qin·ErHu 레이어를 편집해 사용했습니다. <a href="CREDITS.md" target="_blank" rel="noopener">출처와 라이선스</a></p></article></div>`);
+  showModal(`${panelTitle("게임 안내", "낯선 말은 처음 나올 때만 쉽게 설명합니다.")}<div class="glossary-list"><article class="glossary-entry"><strong>무엇을 하면 되나요?</strong><p>장소를 둘러보고 사건을 고른 뒤, 두세 가지 행동 중 하나를 선택합니다. 선택에 따라 돈, 체력, 인물의 신뢰가 달라질 수 있습니다.</p></article><article class="glossary-entry"><strong>전투가 걱정돼요.</strong><p>공격은 피해를 주고, 방어는 다음 피해를 줄이며, 회피는 내공 2를 쓰고 다음 공격에 힘을 더합니다. 패배해도 치료와 재도전이 가능합니다.</p></article><article class="glossary-entry"><strong>저장은 어디에 되나요?</strong><p>진행 상태는 현재 브라우저에 자동 저장됩니다. 저장 메뉴에서 백업 파일로 내보내거나 다시 불러올 수 있습니다.</p></article><article class="glossary-entry"><strong>무협 단어가 어려워요.</strong><p>상단의 수첩 아이콘 또는 아래 수첩 버튼을 눌러 이미 만난 용어를 언제든 확인하세요.</p></article><article class="glossary-entry"><strong>음악 크레딧</strong><p>${MUSIC.map(track=>esc(track.title)).join(" · ")}<br>Kevin MacLeod (<a href="https://incompetech.com" target="_blank" rel="noopener">incompetech.com</a>)<br>Licensed under <a href="https://creativecommons.org/licenses/by/4.0/" target="_blank" rel="noopener">Creative Commons: By Attribution 4.0</a>.<br>음량 조정과 MP3 재인코딩. White Lotus는 앞부분 6분 편집.<br><a href="CREDITS.md" target="_blank" rel="noopener">곡별 출처 · 라이선스</a></p></article></div>`);
 }
 function showMenu() {
   if(!state) {
-    showModal(`${panelTitle("게임 메뉴", "게임을 시작하거나 화면 샘플을 확인하세요.")}<div class="save-options"><button class="save-option" data-action="new-game"><strong>새 여정 시작</strong><small>이름을 정하고 강호에 들어갑니다.</small></button>${QA_MODE?`<button class="save-option" data-action="developer-tools"><strong>화면 검수 도구</strong><small>여정에 영향을 주지 않는 화면 미리보기</small></button>`:""}<button class="save-option" data-panel="about"><strong>게임 안내</strong><small>기본 진행과 저장 방법을 확인합니다.</small></button></div>`);
+    showModal(`${panelTitle("게임 메뉴", "게임을 시작하거나 화면 샘플을 확인하세요.")}<div class="save-options"><button class="save-option" data-action="new-game"><strong>새 여정 시작</strong><small>회사에서 퇴근하는 밤부터 시작합니다.</small></button>${QA_MODE?`<button class="save-option" data-action="developer-tools"><strong>화면 검수 도구</strong><small>여정에 영향을 주지 않는 화면 미리보기</small></button>`:""}<button class="save-option" data-panel="about"><strong>게임 안내</strong><small>기본 진행과 저장 방법을 확인합니다.</small></button></div>`);
     return;
   }
   showModal(`${panelTitle("여정 메뉴", "계속 플레이하거나 기록을 확인하세요.")}<div class="save-options"><button class="save-option" data-action="return"><strong>이야기로 돌아가기</strong><small>현재 장면에서 계속 플레이</small></button><button class="save-option" data-panel="map"><strong>지도</strong><small>방문 가능한 장소 확인</small></button><button class="save-option" data-action="log"><strong>여정 기록</strong><small>지금까지의 사건과 선택</small></button><button class="save-option" data-action="save-panel"><strong>저장 관리</strong><small>수동 저장·내보내기·가져오기</small></button><button class="save-option" data-action="settings"><strong>설정</strong><small>읽기·움직임·소리·전체 화면</small></button>${QA_MODE?`<button class="save-option" data-action="developer-tools"><strong>화면 검수 도구</strong><small>여정에 영향을 주지 않는 화면 미리보기</small></button>`:""}<button class="save-option" data-action="title"><strong>타이틀로 돌아가기</strong><small>현재 여정을 저장하고 처음 화면으로</small></button><button class="save-option" data-panel="about"><strong>게임 안내 · 크레딧</strong><small>조작과 음악 출처</small></button></div>`);
@@ -1019,14 +1053,14 @@ function restAtInn() {
   state.hp=state.maxHp;state.qi=state.maxQi;state.day+=1;addLog("객잔에서 쉬다","따뜻한 밥을 먹고 잠들었다. 체력과 내공이 모두 회복됐다.");save();showToast("푹 쉬었습니다. 체력과 내공이 회복됐어요.");render();
 }
 function newGame() {
-  showModal(`${panelTitle("이름을 정해 주세요", (state||storedSave())?"새 여정을 시작하면 이전 여정은 복구 기록에 보관됩니다. 중요한 기록은 저장 관리에서 파일로도 백업해 주세요.":"이름은 게임 안에서만 사용됩니다. 기본 이름으로 시작해도 괜찮아요.")}<form id="newGameForm"><label for="heroName" class="modal-subtitle">강호에서 불릴 이름</label><input id="heroName" maxlength="12" autocomplete="off" placeholder="나그네" style="width:100%;padding:12px;border:1px solid #ccb995;background:#fffdf6;color:#29372f"><div class="button-row" style="margin-top:14px"><button class="btn btn-primary" type="submit">이 이름으로 시작</button><button class="btn" type="button" data-action="start-default">이름 없이 시작</button></div></form>`);
-  setTimeout(()=>document.getElementById("heroName")?.focus(),0);
+  beginGame('');
 }
 function beginGame(name) {
   importGeneration++;const old=state||storedSave();
   if(old)try{writeSave(localStorage,SLOT_KEY+'departure',old,normalizeSave,makeInitial('나그네'));}catch{showToast('이전 여정을 복구 기록으로 보관하지 못했습니다. 파일로 먼저 백업해 주세요.');return;}
   storageConflict=false;try{observedSave=localStorage.getItem(SAVE_KEY);}catch{}
-  state=makeInitial(name.trim().slice(0,12)||'나그네');setBgmCue('ambient');closeModal();save();render();
+  state=makeInitial('나');state.prologueStep=0;state.nameChosen=false;state.log=[];
+  addLog('야근', '늦은 밤, 사무실을 나섰다.');closeModal();save();render();
 }
 function setQuestTarget() {
   if(state.combat||state.injury||state.tutorial!=="free")return;
@@ -1055,6 +1089,8 @@ document.addEventListener("click",(event)=>{
     if(preview)return showDeveloperTools(preview.dataset.devPreview);
     if(event.target.closest("#devPreviewStage"))return;
   }
+  const dialogue=event.target.closest('[data-dialogue-action]');
+  if(dialogue&&!event.target.closest('button,input,label,form')){const act=dialogue.dataset.dialogueAction;if(act==='advance-prologue')return advancePrologue();if(act==='advance-dialogue')return advanceDialogue();if(act==='advance-encounter')return advanceEncounter();}
   const panel=event.target.closest("[data-panel]");
   if(panel){event.preventDefault();showPanel(panel.dataset.panel);return;}
   const button=event.target.closest("[data-action]");if(!button)return;
@@ -1064,11 +1100,12 @@ document.addEventListener("click",(event)=>{
   if(action==='reload-latest'){const data=storedSave();if(data)resumeGame(data);return;}
   if(action==='confirm-load'){confirmLoad();return;}
   if(action==='advance-dialogue')return advanceDialogue();
+  if(action==='advance-prologue')return advancePrologue();
   if(action==='skip-dialogue'){const beats=chapterDialogue[state?.activeEventId];if(beats){state.dialogueStep=beats.length;save();render();}return;}
   if(action==='toggle-motion'){preferences.reducedMotion=!preferences.reducedMotion;savePreferences();render();showSettings();return;}
   if(action==='test-sound'){playSfx('reward');return;}
   if(action==='fullscreen'){if(document.fullscreenElement)document.exitFullscreen?.().catch(()=>showToast('전체 화면을 종료하지 못했습니다.'));else document.documentElement.requestFullscreen?.().catch(()=>showToast('이 브라우저에서는 전체 화면을 사용할 수 없습니다.'));return;}
-  if(action==='title'){if(state&&!storageConflict&&!save())return;state=null;storageConflict=false;importGeneration++;closeModal();setBgmCue('ambient');render();return;}
+  if(action==='title'){if(state&&!storageConflict&&!save())return;state=null;storageConflict=false;importGeneration++;closeModal();render();return;}
   if(action==="continue-result"){state.result=null;save();render();return;}
   if(action==="new-game")return newGame();
   if(action==="continue"){const data=storedSave();if(data)resumeGame(data);return;}
@@ -1124,7 +1161,7 @@ document.addEventListener("click",(event)=>{
 window.addEventListener("resize",renderBackdrop);
 document.getElementById("modalBackdrop").addEventListener("click",(event)=>{if(event.target.id==="modalBackdrop")closeModal();});
 document.getElementById("menuButton").addEventListener("click",()=>showPanel("menu"));
-document.getElementById("brandHome").addEventListener("click",(event)=>{event.preventDefault();if(state){showMenu();}else renderStart();});
+document.getElementById("brandHome").addEventListener("click",(event)=>{event.preventDefault();if(state){showMenu();}else render();});
 document.getElementById("modalContent").addEventListener("submit",(event)=>{
   if(event.target.id==="newGameForm"){event.preventDefault();beginGame(document.getElementById("heroName").value);}
 });
@@ -1133,12 +1170,13 @@ document.getElementById("modalContent").addEventListener("change",(event)=>{
   if(event.target.dataset.setting==='textSpeed'){preferences.textSpeed=Number(event.target.value);savePreferences();}
 });
 document.getElementById('app').addEventListener('change',event=>{if(event.target.matches('[data-combat-style]')&&state?.combat&&!state.combat.turnPending&&state.skills.includes(event.target.value)){state.combat.style=event.target.value;save();render();}});
+document.getElementById('app').addEventListener('submit',event=>{if(event.target.id==='reincarnationNameForm'){event.preventDefault();chooseReincarnationName(document.getElementById('reincarnationName').value);}});
 document.getElementById("modalContent").addEventListener("input",(event)=>{
   const control=event.target.closest("[data-audio]");if(!control)return;
   const amount=Number(control.value)/100;
   audioSettings[control.dataset.audio]=amount;
   try{localStorage.setItem(AUDIO_KEY,JSON.stringify(audioSettings));}catch{}
-  if(control.dataset.audio==='bgm'||control.dataset.audio==='master'){clearInterval(fadeTimer);activeTracks().forEach((track)=>{if(track===activeCue&&!track.paused)track.volume=audioSettings.master*audioSettings.bgm;else{track.pause();track.volume=0;}});}
+  if(control.dataset.audio==='bgm'||control.dataset.audio==='master'){clearInterval(fadeTimer);activeTracks().forEach((track)=>{if(track===activeCue&&!track.paused)track.volume=musicVolume();else{track.pause();track.volume=0;}});}
   const label=control.closest("label")?.querySelector("b");if(label)label.textContent=`${control.value}%`;
 });
 document.addEventListener("keydown",(event)=>{
@@ -1152,6 +1190,7 @@ document.addEventListener("keydown",(event)=>{
   if(storageConflict)return;
   if(event.target.closest("input,textarea,select")||!document.getElementById("modalBackdrop").hidden)return;
   if(event.repeat)return;
+  if(state?.prologueStep!=null&&['Enter',' '].includes(event.key)&&!event.target.closest('button')){event.preventDefault();advancePrologue();return;}
   if(state?.tutorial==='encounter'&&['Enter',' '].includes(event.key)&&!event.target.closest('button')){event.preventDefault();advanceEncounter();return;}
   if(state?.activeEventId&&chapterDialogue[state.activeEventId]&&(state.dialogueStep||0)<chapterDialogue[state.activeEventId].length&&['Enter',' '].includes(event.key)&&!event.target.closest('button')){event.preventDefault();advanceDialogue();return;}
   if(!state?.combat||state.combat.turnPending)return;
@@ -1165,5 +1204,6 @@ activeCue=mainBgm;
 document.addEventListener('visibilitychange',()=>{if(document.hidden){stopAllMusic();finishTyping?.();}else if(musicEnabled)startMusic();});
 window.addEventListener('storage',(event)=>{if(event.key===SAVE_KEY&&state&&event.newValue!==observedSave){storageConflict=true;showStorageConflict();}});
 document.body.classList.remove('booting');document.querySelector('.topbar').inert=false;
+document.querySelectorAll('[data-icon]').forEach(node=>node.innerHTML=icon(node.dataset.icon));
 syncMusicButton();render();
 if(typeof Image!=='undefined'){warmCharacters();for(const src of ['assets/portraits-atlas.png','assets/items-atlas.png','assets/weapon-extras-atlas.png'])preloadImage(src);for(const loc of ['market','alley','sect','forest'])warmScene(loc,window.matchMedia('(max-aspect-ratio:3/4)').matches);}
