@@ -41,3 +41,10 @@ Use case: illustration-story. Production background CG for a Korean wuxia reinca
 ### alley
 
 Create a brand new premium 16:9 widescreen cinematic illustration for a Korean wuxia visual novel, painterly hand drawn anime/manhwa style, not 3D. Nighttime confrontation in a narrow ancient Chinese market alley, wet stone pavement reflecting red lanterns, richly detailed dark indigo tiled roofs and warm copper light. On the LEFT stands the protagonist: a 28 year old Korean man, short black tousled hair, handsome but ordinary face, charcoal travel robes with a muted crimson sash, cautiously holding a simple wooden practice sword. On the RIGHT stands a rugged intimidating black-haired bandit in rough dark robes holding a steel dao sword. Clear opposing silhouettes, elegant painterly brushstrokes, cinematic depth, sharp detailed environment. Palette midnight indigo, vermilion, muted copper. Leave the bottom quarter without important faces or details for dialogue UI. No text, no typography, no logos, no interface. Image should feel like an expensive narrative game CG.
+
+
+## 2.1 · 2026-10-03
+
+내장 image_gen으로 생활·조력자 CG 9개, 인물 없는 전투 배경 3개, 투명 전신 2개를 새로 제작했습니다. 총 14개 최종 에셋을 assets/vn/에 포함했습니다. clinic, soup, homesick, market, chores, practice, porter, companions, homecoming, alley-stage, practice-stage, road, traveler-novice, soyeon-standing입니다.
+
+WebP 변환은 quality 90이며 투명 전신의 알파를 보존했습니다. 동행 CG는 최종적으로 porter의 도강을 외형 참조로 재생성했습니다. 각 프롬프트와 파일 경로는 [2.1 제작 기록](ASSET_PROMPTS_2.1.md)에 기록했습니다. 음악 10곡과 그 라이선스는 2.0과 같습니다.

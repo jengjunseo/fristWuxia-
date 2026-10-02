@@ -1,4 +1,5 @@
 import {events, locationData, itemData} from './events.js?v=3';
+import {journey} from './journey.js';
 
 // Both disk imports and local saves pass through the same v1-compatible boundary.
 export function normalizeSave(input, initial) {
@@ -16,7 +17,7 @@ export function normalizeSave(input, initial) {
     if (!Array.isArray(s[key]) || s[key].length > 10000) throw new Error(`Invalid ${key}`);
   }
   if (s.done.some(v => typeof v !== 'string') || s.skills.some(v => !['sword','fist','lightness'].includes(v)) || s.discoveredTerms.some(v=>typeof v!=='string'||v.length>30) || s.log.some(v=>!object(v)||typeof v.title!=='string'||v.title.length>200||typeof v.text!=='string'||v.text.length>10000||!Number.isInteger(v.day)||v.day<1)) throw new Error('Invalid records');
-  s.done = [...new Set(s.done.filter(id=>events.some(e=>e.id===id)))];
+  s.done = [...new Set(s.done.filter(id=>events.some(e=>e.id===id)||journey.some(e=>e.id===id)))];
   s.skills = [...new Set(s.skills)];
   s.visited = [...new Set([...s.visited.filter(id=>Object.hasOwn(locationData,id)),s.location])];
   s.log = s.log.slice(0,50);
@@ -41,6 +42,10 @@ export function normalizeSave(input, initial) {
   if(s.dialogueStep!=null&&(!Number.isInteger(s.dialogueStep)||s.dialogueStep<0||s.dialogueStep>20))throw new Error('Invalid dialogue');
   if(s.prologueStep!=null&&(!Number.isInteger(s.prologueStep)||s.prologueStep<0||s.prologueStep>16))throw new Error('Invalid prologue');
   if(typeof s.nameChosen!=='boolean')throw new Error('Invalid name state');
+  if(typeof s.storyMode!=='boolean'||!Number.isInteger(s.storyStep)||s.storyStep<0||s.storyStep>journey.length)throw new Error('Invalid story position');
+  if(s.storyMode&&s.storyStep<journey.length&&s.dialogueStep>=journey[s.storyStep].lines.length)throw new Error('Invalid story line');
+  if(s.storyMode&&(s.combat||s.injury)&&journey[s.storyStep]?.combat!==(s.combat?.id||s.injury))throw new Error('Invalid story battle');
+  if(s.storyBattle!=null&&(!s.storyMode||s.storyBattle!==journey[s.storyStep]?.id||!journey[s.storyStep]?.combat||(!s.combat&&!s.injury)))throw new Error('Invalid story battle reference');
   if(s.prologueStep!=null&&(s.tutorial!=='intro'||s.combat||s.injury||s.activeEventId||s.mainStage!==0||s.flags.prologueComplete))throw new Error('Invalid opening state');
   if(s.prologueStep>12&&!s.nameChosen)throw new Error('Missing reincarnated name');
   if(s.encounterStep!=null&&(!Number.isInteger(s.encounterStep)||s.encounterStep<0||s.encounterStep>4))throw new Error('Invalid encounter');
@@ -57,12 +62,12 @@ export function normalizeSave(input, initial) {
     for(const k of ['pendingDamage','opening'])if(c[k]!=null&&(!Number.isInteger(c[k])||c[k]<0||c[k]>100000))throw new Error('Invalid strike');
     for(const k of ['guard','evade','openingGuard','turnPending','assisted'])if(c[k]!=null&&typeof c[k]!=='boolean')throw new Error('Invalid combat flag');
     if(c.pendingDamage&&!c.turnPending)throw new Error('Strike without a turn');
-    c.enemy = {intro:'골목의 강도',midboss:'흰 옷 검객',final:'운해 검성'}[c.id];
+    c.enemy = s.storyMode?{intro:'골목의 강도',midboss:'소연',final:'산길의 약탈자'}[c.id]:{intro:'골목의 강도',midboss:'흰 옷 검객',final:'운해 검성'}[c.id];
     c.logs=c.logs.slice(-8).map(v=>v.slice(0,1000));
     c.feedback=typeof c.feedback==='string'?c.feedback.slice(0,1000):'';
     if(c.lastMove!=null&&!['attack','defend','dodge','skill','item'].includes(c.lastMove))throw new Error('Invalid action');
     if(c.style!=null&&!['sword','fist','lightness'].includes(c.style))throw new Error('Invalid skill');
-    if(c.id!=='intro' && (!s.pendingCombatChoice || events.find(e=>e.id===s.pendingCombatChoice.eventId).choices[s.pendingCombatChoice.choice].effects.combat!==c.id)) throw new Error('Missing combat event');
+    if(c.id!=='intro' && !s.storyMode && (!s.pendingCombatChoice || events.find(e=>e.id===s.pendingCombatChoice.eventId).choices[s.pendingCombatChoice.choice].effects.combat!==c.id)) throw new Error('Missing combat event');
     c.resolveTimer=false;
     c.turnPending=Boolean(c.turnPending);
     s.tutorial=c.id==='intro'?'combat':'free';
@@ -70,7 +75,7 @@ export function normalizeSave(input, initial) {
     s.encounterStep=null;
   } else if(s.tutorial==='combat'&&!s.injury) s.tutorial='encounter';
   if(s.injury&&!['intro','midboss','final'].includes(s.injury))throw new Error('Invalid recovery');
-  if(s.injury&&s.injury!=='intro'&&!s.pendingCombatChoice)throw new Error('Missing recovery event');
+  if(s.injury&&s.injury!=='intro'&&!s.storyMode&&!s.pendingCombatChoice)throw new Error('Missing recovery event');
   if(!s.combat&&!s.injury)s.pendingCombatChoice=null;
   if(s.result && (!object(s.result)||typeof s.result.title!=='string'||typeof s.result.text!=='string'))s.result=null;
   if(s.result)s.result.reward=typeof s.result.reward==='string'?s.result.reward.slice(0,2000):'';

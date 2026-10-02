@@ -9,6 +9,7 @@ import {chapterDialogue,endingLetters} from '../narrative.js';
 import {prologue,sceneIllustrations} from '../prologue.js';
 import {MUSIC} from '../music.js';
 import {icon} from '../icons.js';
+import {journey,currentChapter,legacyStorySteps} from '../journey.js';
 
 const source=(await readFile(new URL('../game.js',import.meta.url),'utf8')).replace(/^import .*;\r?\n/gm,'');
 function game() {
@@ -17,7 +18,7 @@ function game() {
   const get=id=>{if(!nodes.has(id))nodes.set(id,node());return nodes.get(id)};
   const audio=()=>({paused:true,volume:0,play(){this.paused=false;return Promise.resolve()},pause(){this.paused=true}});
   Object.assign(get('mainBgm'),audio());
-  const ctx=vm.createContext({...data,normalizeSave,readSave,writeSave,BACKUP_KEY,SLOT_KEY,chapterDialogue,endingLetters,prologue,sceneIllustrations,MUSIC,icon,URLSearchParams,console,performance,Audio:function(){return audio()},localStorage:{getItem(k){return store.get(k)||null},setItem(k,v){store.set(k,v)}},document:{getElementById:get,querySelector:selector=>selector.includes("[data-typewriter]")?null:get(selector),querySelectorAll(){return []},addEventListener(){},body:node()},window:{matchMedia(){return {matches:false}},addEventListener(){},innerWidth:1600,innerHeight:900,scrollTo(){}},setTimeout(fn){tasks.push(fn);return tasks.length},clearTimeout(){},setInterval(){return 1},clearInterval(){},requestAnimationFrame(){},cancelAnimationFrame(){}});
+  const ctx=vm.createContext({...data,normalizeSave,readSave,writeSave,BACKUP_KEY,SLOT_KEY,chapterDialogue,endingLetters,prologue,sceneIllustrations,MUSIC,icon,journey,currentChapter,legacyStorySteps,preloadImage:()=>Promise.resolve(true),URLSearchParams,console,performance,Audio:function(){return audio()},localStorage:{getItem(k){return store.get(k)||null},setItem(k,v){store.set(k,v)}},document:{getElementById:get,querySelector:selector=>selector.includes("[data-typewriter]")?null:get(selector),querySelectorAll(){return []},addEventListener(){},body:node()},window:{matchMedia(){return {matches:false}},addEventListener(){},innerWidth:1600,innerHeight:900,scrollTo(){}},setTimeout(fn){tasks.push(fn);return tasks.length},clearTimeout(){},setInterval(){return 1},clearInterval(){},requestAnimationFrame(){},cancelAnimationFrame(){}});
   vm.runInContext(source,ctx);
   const run=s=>vm.runInContext(s,ctx);
   run('state=makeInitial("검수");');
@@ -152,7 +153,7 @@ test('modern opening precedes reincarnation and only the elder can ask for a nam
   g.run('chooseReincarnationName("  청명  ");');assert.equal(g.get().name,'청명');assert.equal(g.get().nameChosen,true);assert.equal(g.get().prologueStep,13);
   assert.match(g.run('renderPrologue()'),/청명 공이라/);
   for(let step=13;step<prologue.length;step++)g.run('inputAfter=0;advancePrologue();');
-  assert.equal(g.get().prologueStep,null);assert.ok(g.get().flags.prologueComplete);assert.equal(g.get().tutorial,'intro');g.run('openingChoice(0);');assert.equal(g.get().tutorial,'encounter');
+  assert.equal(g.get().prologueStep,null);assert.ok(g.get().flags.prologueComplete);assert.equal(g.get().tutorial,'free');assert.equal(g.get().storyStep,0);g.run('openingChoice(0);');assert.equal(g.get().storyStep,0);assert.equal(g.get().tutorial,'free');
 });
 test('opening saves resume at the same line including the unanswered name question',()=>{
   for(const step of [0,3,6,8,12,13,16]){
@@ -190,4 +191,81 @@ test('every main-story choice combination can finish with each training style',(
     assert.equal(g.get().mainStage,7);assert.ok(g.get().flags.titleEarned);
     assert.equal(normalizeSave(g.get(),g.run('makeInitial("검수")')).mainStage,7);
   }
+});
+
+test('the linear journey plays every chapter in order and ends as a beginner',()=>{
+  const g=game();g.run('beginGame("");');
+  while(g.get().prologueStep!=null){
+    if(prologue[g.get().prologueStep].nameEntry)g.run('chooseReincarnationName("새벽");');
+    else g.run('inputAfter=0;advancePrologue();');
+  }
+  for(let step=0;step<journey.length;step++){
+    assert.equal(g.get().storyStep,step);
+    for(let line=0;line<journey[step].lines.length;line++)g.run('inputAfter=0;advanceStory();');
+    for(let round=0;g.get().combat&&round<8;round++){g.run('combatMove("defend")');g.flush();}
+    assert.equal(g.get().injury,null,journey[step].id);
+    assert.equal(g.get().storyStep,step+1,journey[step].id);
+    assert.ok(g.get().done.includes(journey[step].id));
+    const saved=normalizeSave(g.get(),g.run('makeInitial("검수")'));
+    assert.equal(saved.storyStep,step+1);
+  }
+  assert.ok(g.get().flags.journeyComplete);assert.ok(!g.get().flags.titleEarned);
+  assert.equal(g.get().skills.length,1);assert.ok(g.get().day<30);
+  for(const id of ['innkeeper','physician','disciple','guard','mentor'])assert.ok(g.get().trust[id]>0,id);
+  assert.match(g.run('renderStory()'),/돌아갈 곳/);
+});
+test('linear dialogue cannot offer exploratory choices or grant repeated chapter rewards',()=>{
+  const g=game();g.run('state.storyMode=true;state.tutorial="free";state.flags.prologueComplete=true;');
+  for(let step=0;step<journey.length;step++){
+    g.run(`state.storyStep=${step};state.dialogueStep=0;`);
+    const html=g.run('renderStory()');
+    assert.ok(!/event-card|choice-button|choose-event|opening-choice|event-cg/.test(html),journey[step].id);
+    assert.equal((html.match(/class="vn-art"/g)||[]).length,1);
+  }
+  g.run('state.storyStep=4;state.dialogueStep=currentChapter(state).lines.length-1;inputAfter=0;advanceStory();advanceStory();');
+  assert.equal(g.get().storyStep,5);assert.equal(g.get().coin,2);assert.equal(g.get().dialogueStep,0);
+});
+test('every linear battle save resumes the current turn and continues only once',()=>{
+  for(const [step,chapter] of journey.entries())if(chapter.combat){
+    const g=game();g.run(`state.storyMode=true;state.tutorial="free";state.storyStep=${step};state.dialogueStep=${chapter.lines.length-1};state.storyBattle="${chapter.id}";startCombat("${chapter.combat}");combatMove("defend");`);
+    const saved=normalizeSave(g.get(),g.run('makeInitial("검수")'));
+    g.run('state=normalizeSave('+JSON.stringify(saved)+',makeInitial("검수"));render();');g.flush();
+    assert.equal(g.get().combat.round,1);
+    const target=chapter.combat==='final'?4:3;
+    for(let r=1;r<target;r++){g.run('combatMove("defend")');g.flush();}
+    assert.equal(g.get().combat,null);assert.equal(g.get().storyStep,step+1);
+    g.flush();assert.equal(g.get().storyStep,step+1);
+  }
+});
+test('asking for help advances every linear battle without a retry loop',()=>{
+  for(const [step,chapter] of journey.entries())if(chapter.combat){
+    const g=game();g.run(`state.storyMode=true;state.tutorial="free";state.storyStep=${step};state.dialogueStep=${chapter.lines.length-1};state.storyBattle="${chapter.id}";startCombat("${chapter.combat}");combatMove("flee");`);
+    const saved=normalizeSave(g.get(),g.run('makeInitial("검수")'));assert.equal(saved.injury,chapter.combat);
+    g.run('acceptHelp();acceptHelp();');assert.equal(g.get().storyStep,step+1);assert.equal(g.get().injury,null);assert.ok(g.get().flags.acceptedHelp);
+  }
+});
+test('old exploration saves enter the corresponding linear chapter with their equipment intact',()=>{
+  for(let stage=0;stage<8;stage++){
+    const g=game();g.run(`state.mainStage=${stage};state.tutorial="free";state.coin=17;grantItem("weapon-iron-jian");state.gear.weapon="weapon-iron-jian";resumeGame(state);`);
+    assert.ok(g.get().storyMode);assert.equal(g.get().coin,17);assert.equal(g.get().gear.weapon,'weapon-iron-jian');
+    assert.equal(normalizeSave(g.get(),g.run('makeInitial("검수")')).storyStep,g.get().storyStep);
+    assert.ok(!/event-card|choice-button/.test(g.run('renderStory()')));
+  }
+});
+test('corrupt linear positions and mismatched battle scenes are rejected',()=>{
+  const g=game();g.run('state.storyMode=true;state.tutorial="free";');const base=g.get();
+  for(const patch of [{storyStep:journey.length+1},{storyStep:-1},{storyStep:1.5},{storyMode:'yes'},{dialogueStep:journey[0].lines.length},{storyBattle:journey[9].id},{injury:'final'}])assert.throws(()=>normalizeSave({...base,...patch},base));
+});
+test('old battle and injury saves migrate to the correct linear battle chapter',()=>{
+  for(const [battle,step] of Object.entries(legacyStorySteps))for(const injured of [false,true]){
+    const g=game();g.run(`state.tutorial="free";startCombat("${battle}");${injured?'state.combat=null;state.injury="'+battle+'";':''}resumeGame(state);`);
+    assert.equal(g.get().storyStep,step);assert.equal(journey[step].combat,battle);
+    const saved=normalizeSave(g.get(),g.run('makeInitial("검수")'));
+    assert.equal(saved.storyBattle,journey[step].id);
+    if(injured){g.run('acceptHelp();');assert.equal(g.get().storyStep,step+1);}
+  }
+});
+test('a story click completes typing before moving to the next line',()=>{
+  const g=game();g.run('state.storyMode=true;state.tutorial="free";var finished=0;finishTyping=()=>{finished++;finishTyping=null;};inputAfter=0;advanceStory();');
+  assert.equal(g.run('finished'),1);assert.equal(g.get().dialogueStep,0);g.run('inputAfter=0;advanceStory();');assert.equal(g.get().dialogueStep,1);
 });

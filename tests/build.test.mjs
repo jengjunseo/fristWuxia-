@@ -4,6 +4,7 @@ import {readFile,stat} from 'node:fs/promises';
 import {fileURLToPath} from 'node:url';
 import path from 'node:path';
 import {MUSIC} from '../music.js';
+import {journey} from '../journey.js';
 
 test('production build contains its module graph, local font licenses and media',async()=>{
   const root=fileURLToPath(new URL('../',import.meta.url));
@@ -21,4 +22,5 @@ test('production build contains its module graph, local font licenses and media'
   const runtime=html+await readFile(path.join(root,'dist/game.js'),'utf8');
   for(const phrase of ['무림 초보의 모험기','한 번 누르면 문장 완성','선택으로 쓰는 무협','세 번의 승부','이야기의 끝에서 당신의 선택'])assert.ok(!runtime.includes(phrase),phrase);
   assert.ok(!/asianoriental2|samurai-/.test(runtime));
+  for(const file of ['journey.js',...new Set(journey.map(scene=>'assets/vn/'+scene.art+'.webp')),'assets/vn/alley-stage.webp','assets/vn/practice-stage.webp','assets/vn/traveler-novice.webp','assets/vn/soyeon-standing.webp'])assert.ok((await stat(path.join(root,'dist',file))).size>0,file);
 });
