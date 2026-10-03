@@ -1,5 +1,6 @@
 import {events, locationData, itemData} from './events.js?v=3';
 import {journey} from './journey.js';
+import {activityFor,normalizeActivity} from './minigames.js';
 
 // Both disk imports and local saves pass through the same v1-compatible boundary.
 export function normalizeSave(input, initial) {
@@ -43,6 +44,9 @@ export function normalizeSave(input, initial) {
   if(s.prologueStep!=null&&(!Number.isInteger(s.prologueStep)||s.prologueStep<0||s.prologueStep>16))throw new Error('Invalid prologue');
   if(typeof s.nameChosen!=='boolean')throw new Error('Invalid name state');
   if(typeof s.storyMode!=='boolean'||!Number.isInteger(s.storyStep)||s.storyStep<0||s.storyStep>journey.length)throw new Error('Invalid story position');
+  if(!Array.isArray(s.activityCleared)||s.activityCleared.some(id=>typeof id!=='string'||!activityFor(id)||journey.findIndex(c=>c.id===id)>s.storyStep)||new Set(s.activityCleared).size!==s.activityCleared.length)throw new Error('Invalid activity history');
+  s.minigame=normalizeActivity(s.minigame,journey[s.storyStep]?.id);
+  if(s.minigame&&(!s.storyMode||s.prologueStep!=null||s.combat||s.injury||s.activityCleared.includes(s.minigame.id)||s.dialogueStep<activityFor(s.minigame.id).after))throw new Error('Invalid activity position');
   if(s.storyMode&&s.storyStep<journey.length&&s.dialogueStep>=journey[s.storyStep].lines.length)throw new Error('Invalid story line');
   if(s.storyMode&&(s.combat||s.injury)&&journey[s.storyStep]?.combat!==(s.combat?.id||s.injury))throw new Error('Invalid story battle');
   if(s.storyBattle!=null&&(!s.storyMode||s.storyBattle!==journey[s.storyStep]?.id||!journey[s.storyStep]?.combat||(!s.combat&&!s.injury)))throw new Error('Invalid story battle reference');

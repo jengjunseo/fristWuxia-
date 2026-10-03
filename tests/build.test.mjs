@@ -13,7 +13,7 @@ test('production build contains its module graph, local font licenses and media'
   assert.ok(!html.includes('fonts.googleapis.com'));
   assert.ok(html.includes('app.css'));
   for(const file of ['boot.js','game.js','events.js','save-state.js','storage.js','narrative.js','resources.js','app.css','assets/fonts/OFL.txt','assets/fonts/GowunBatang-Regular.woff2','assets/fonts/GowunBatang-Bold.woff2','assets/seal.svg','assets/remaster/traveler-standing.webp','assets/remaster/final-wide.webp','assets/remaster/final-mobile.webp'])assert.ok((await stat(path.join(root,'dist',file))).size>0,file);
-  for(const file of ['boot.js','game.js','save-state.js']){
+  for(const file of ['boot.js','game.js','save-state.js','minigames.js','minigame-art.js']){
     const code=await readFile(path.join(root,'dist',file),'utf8');
     for(const match of code.matchAll(/(?:from|import\()\s*["'](\.\/[^"']+)/g))await stat(path.join(root,'dist',match[1].split('?')[0]));
   }

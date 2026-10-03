@@ -4,7 +4,7 @@ $port = 4190
 $running = $false
 try {
     $info = Invoke-RestMethod -Uri "http://127.0.0.1:$port/package.json" -TimeoutSec 1
-    $running = $info.name -eq 'gangho-first-steps' -and $info.version -eq '2.1.0'
+    $running = $info.name -eq 'gangho-first-steps' -and $info.version -eq '2.2.0'
 } catch { $running = $false }
 if (-not $running) {
     $previousPort = $env:PORT
@@ -18,7 +18,7 @@ if (-not $running) {
         Start-Sleep -Milliseconds 250
         try {
             $info = Invoke-RestMethod -Uri "http://127.0.0.1:$port/package.json" -TimeoutSec 1
-            $running = $info.name -eq 'gangho-first-steps' -and $info.version -eq '2.1.0'
+            $running = $info.name -eq 'gangho-first-steps' -and $info.version -eq '2.2.0'
         } catch { $running = $false }
     }
 }

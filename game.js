@@ -8,6 +8,7 @@ import { prologue, sceneIllustrations } from "./prologue.js";
 import { MUSIC } from "./music.js";
 import { icon } from "./icons.js";
 import { journey, currentChapter, legacyStorySteps } from "./journey.js";
+import { activityFor, createActivity, activityAction, renderActivity } from "./minigames.js";
 
 const SAVE_KEY = "jianghu-first-steps-save-v1";
 const MUSIC_KEY = "jianghu-first-steps-music-v1";
@@ -167,7 +168,7 @@ function makeInitial(name) {
     mainStage: 0, flags: {}, trust: {}, rumors: 0, clues: [], done: [], lastDay: {}, day: 1,
     discoveredTerms: ["강호","무공","내공"], history: [], activeEventId: null, tutorial: "intro", combat: null,
     pendingCombatChoice: null, injury: null, guide: preferences.guide, largeText: preferences.largeText, visited: ["market"], dialogueStep:0,prologueStep:null,nameChosen:true,
-    storyMode:false, storyStep:0, storyBattle:null,
+    storyMode:false, storyStep:0, storyBattle:null, minigame:null, activityCleared:[],
     log: [{title:"낯선 장터", text:"정신을 차리니 낯선 장터였다. 가진 돈은 없고 배는 고프다.", day:1}]
   };
 }
@@ -366,29 +367,53 @@ function chooseReincarnationName(name){
 function renderStory(){
   const chapter=currentChapter(state);
   if(!chapter)return renderStoryEnding();
+  if(state.minigame)return vnStage(chapter.art,renderActivity(state.minigame,{icon,reducedMotion:preferences.reducedMotion}),`<h2>${esc(chapter.title)}</h2><span class="story-day">${state.day}일째</span>`).replace('class="vn-stage','class="vn-stage activity-stage');
   const next=journey[state.storyStep+1];if(next&&typeof Image!=='undefined')preloadImage('assets/vn/'+next.art+'.webp');
   const step=Math.min(chapter.lines.length-1,state.dialogueStep||0);
   const [speaker,text]=chapter.lines[step];
   const header=`<h2>${esc(chapter.title)}</h2><span class="story-day">${state.day}일째</span>`;
-  return vnStage(chapter.art,vnDialogue(speaker==='나'?state.name:speaker,text,'advance-story',step===chapter.lines.length-1?(chapter.combat?'전투 시작':'다음 장면'):'다음'),header);
+  const activity=activityFor(chapter.id),taskAhead=activity&&step>=activity.after&&!state.activityCleared.includes(chapter.id);
+  return vnStage(chapter.art,vnDialogue(speaker==='나'?state.name:speaker,text,'advance-story',taskAhead?'직접 해보기':step===chapter.lines.length-1?(chapter.combat?'전투 시작':'다음 장면'):'다음'),header);
 }
 function advanceStory(){
-  if(!state?.storyMode||state.prologueStep!=null||state.combat||state.injury||state.storyStep>=journey.length)return;
+  if(!state?.storyMode||state.prologueStep!=null||state.combat||state.injury||state.minigame||state.storyStep>=journey.length)return;
   if(finishTyping){finishTyping();return;}if(performance.now()<inputAfter)return;
   inputAfter=performance.now()+180;
   const chapter=currentChapter(state);
+  const activity=activityFor(chapter.id);
+  if(activity&&state.dialogueStep>=activity.after&&!state.activityCleared.includes(chapter.id)){state.minigame=createActivity(chapter.id);save();render();return;}
   if(state.dialogueStep<chapter.lines.length-1){state.dialogueStep++;save();render();return;}
   if(chapter.combat){state.storyBattle=chapter.id;startCombat(chapter.combat);return;}
   completeStoryChapter();
 }
 function completeStoryChapter(){
   const chapter=currentChapter(state);if(!chapter)return;
+  if(activityFor(chapter.id)&&!state.activityCleared.includes(chapter.id)){state.minigame=createActivity(chapter.id);save();render();return;}
   applyEffects(chapter.effects);
   if(!state.done.includes(chapter.id))state.done.push(chapter.id);
   addLog(chapter.title,chapter.lines.filter(([who])=>!who).at(-1)?.[1]||chapter.lines.at(-1)[1]);
   state.storyStep++;state.dialogueStep=0;state.storyBattle=null;state.result=null;state.tutorial='free';state.activeEventId=null;
   const next=currentChapter(state);if(next)preloadImage('assets/vn/'+next.art+'.webp');
   save();render();
+}
+function actInActivity(task,value){
+  if(!state?.minigame||state.combat||state.injury||storageConflict||document.hidden||!document.getElementById('modalBackdrop').hidden)return;
+  if(task==='hit'){
+    if(state.minigame.manual||preferences.reducedMotion)value=state.minigame.value;
+    else {
+      const track=document.querySelector('.mg-track'),needle=document.querySelector('.mg-needle');
+      if(!track||!needle)return;
+      const t=track.getBoundingClientRect(),n=needle.getBoundingClientRect();value=((n.left+n.width/2-t.left)/t.width)*100;
+    }
+  }
+  const previous=state.minigame,next=activityAction(previous,task,value);if(next===previous)return;
+  state.minigame=next;save();render();playSfx(next.cleared?'victory':next.progress>previous.progress?'reward':'click');
+}
+function continueActivity(){
+  if(!state?.minigame?.cleared||storageConflict)return;
+  const id=currentChapter(state)?.id;if(id!==state.minigame.id)return;
+  if(!state.activityCleared.includes(id))state.activityCleared.push(id);
+  state.minigame=null;inputAfter=0;advanceStory();
 }
 function renderStoryEnding(){
   return vnStage('homecoming',`<section class="story-ending"><h2>돌아갈 곳</h2><p>${esc(state.name)}</p><div class="button-row"><button class="btn btn-primary" data-action="story-record">여정 기록</button><button class="btn" data-action="title">타이틀로</button></div></section>`);
@@ -654,7 +679,7 @@ function render() {
   const revision=++renderRevision;
   const root=document.getElementById("app"), nav=document.getElementById("quickNav");
   const inPrologue=state?.prologueStep!=null&&!state.flags.prologueComplete;
-  const sceneKey=!state?"welcome":inPrologue?`prologue-${state.prologueStep}`:state.combat?`combat-${state.combat.id}`:state.injury?`injury-${state.injury}`:state.storyMode?`story-${state.storyStep}-${state.dialogueStep}`:state.result?`result-${state.result.title}`:state.activeEventId?`${state.activeEventId}-${state.dialogueStep||0}`:`${state.tutorial}-${state.mainStage}-${state.location}-${state.encounterStep??""}`;
+  const sceneKey=!state?"welcome":inPrologue?`prologue-${state.prologueStep}`:state.combat?`combat-${state.combat.id}`:state.injury?`injury-${state.injury}`:state.minigame?`activity-${state.minigame.id}-${state.minigame.cleared}`:state.storyMode?`story-${state.storyStep}-${state.dialogueStep}`:state.result?`result-${state.result.title}`:state.activeEventId?`${state.activeEventId}-${state.dialogueStep||0}`:`${state.tutorial}-${state.mainStage}-${state.location}-${state.encounterStep??""}`;
   const previousScene=root.dataset.scene,changed=previousScene!==sceneKey, active=document.activeElement;
   const cinematicKey=inPrologue?'prologue-'+prologue[state.prologueStep].art:state?.storyMode&&!state.combat&&!state.injury?'story-'+(currentChapter(state)?.art||'homecoming'):state?.activeEventId?state.activeEventId+'-'+(chapterDialogue[state.activeEventId]&&(state.dialogueStep||0)<chapterDialogue[state.activeEventId].length?'dialogue':'choice'):state?.tutorial==='encounter'?'encounter':sceneKey;
   const transitionScene=changed&&Boolean(previousScene)&&root.dataset.visual!==cinematicKey;
@@ -694,11 +719,17 @@ function render() {
   if(transitionScene&&!preferences.reducedMotion)root.firstElementChild?.classList.add('scene-arrive');
   root.inert=!document.getElementById('modalBackdrop').hidden;
   if(drawerOpen&&!changed){const drawer=root.querySelector('.journey-drawer');if(drawer)drawer.open=true;}
-  if(!changed&&document.getElementById('modalBackdrop').hidden){if(styleFocus)root.querySelector('[data-combat-style]')?.focus({preventScroll:true});else if(focusMove)root.querySelector(`[data-move="${focusMove}"]:not(:disabled)`)?.focus({preventScroll:true});}
+  if(!changed&&document.getElementById('modalBackdrop').hidden){
+    if(state?.minigame&&active?.dataset?.task){
+      const nextFocus=root.querySelector(`[data-task="${active.dataset.task}"][data-value="${CSS.escape(active.dataset.value||'')}"]:not(:disabled)`)
+        ||root.querySelector('.mg-cell.reachable,[data-task="card"]:not(:disabled),[data-task="token"]:not(:disabled),.mg-primary');
+      nextFocus?.focus({preventScroll:true});
+    }else if(styleFocus)root.querySelector('[data-combat-style]')?.focus({preventScroll:true});else if(focusMove)root.querySelector(`[data-move="${focusMove}"]:not(:disabled)`)?.focus({preventScroll:true});
+  }
   if(changed)requestAnimationFrame(()=>{
     if(root.dataset.scene!==sceneKey)return;
     if(!(state?.activeEventId&&previousScene?.startsWith(state.activeEventId+'-'))&&!(state?.tutorial==='encounter'&&previousScene?.startsWith('encounter-'))&&!inPrologue&&!(state?.storyMode&&previousScene?.startsWith('story-'+state.storyStep+'-')))window.scrollTo({top:0,behavior:'instant'});
-    if(document.getElementById('modalBackdrop').hidden){const focus=root.querySelector('[data-action="advance-prologue"],[data-action="advance-story"],[data-action="advance-dialogue"],[data-action="advance-encounter"],h2,h1');if(focus){if(focus.tagName!=='BUTTON')focus.tabIndex=-1;focus.focus({preventScroll:true});}}
+    if(document.getElementById('modalBackdrop').hidden){const focus=(state?.minigame?(root.querySelector('[data-action="activity-continue"]')||root.querySelector('.mg-play h2')):null)||root.querySelector('[data-action="advance-prologue"],[data-action="advance-story"],[data-action="advance-dialogue"],[data-action="advance-encounter"],h2,h1');if(focus){if(focus.tagName!=='BUTTON')focus.tabIndex=-1;focus.focus({preventScroll:true});}}
   });
   };
   const art=inPrologue?prologue[state.prologueStep].art:state?.storyMode&&!state.combat&&!state.injury?(currentChapter(state)?.art||'homecoming'):null;
@@ -1166,6 +1197,9 @@ document.addEventListener("click",(event)=>{
   if(action==='advance-dialogue')return advanceDialogue();
   if(action==='advance-prologue')return advancePrologue();
   if(action==='advance-story')return advanceStory();
+  if(action==='activity')return actInActivity(button.dataset.task,['card','coin','token','bin','cell','tally'].includes(button.dataset.task)?Number(button.dataset.value):button.dataset.value);
+  if(action==='activity-continue')return continueActivity();
+  if(action==='activity-restart'){if(state?.minigame&&!state.minigame.cleared){state.minigame=createActivity(state.minigame.id);save();render();}return;}
   if(action==='story-record')return showLog();
   if(action==='skip-dialogue'){const beats=chapterDialogue[state?.activeEventId];if(beats){state.dialogueStep=beats.length;save();render();}return;}
   if(action==='toggle-motion'){preferences.reducedMotion=!preferences.reducedMotion;savePreferences();render();showSettings();return;}
@@ -1236,6 +1270,11 @@ document.getElementById("modalContent").addEventListener("change",(event)=>{
   if(event.target.dataset.setting==='textSpeed'){preferences.textSpeed=Number(event.target.value);savePreferences();}
 });
 document.getElementById('app').addEventListener('change',event=>{if(event.target.matches('[data-combat-style]')&&state?.combat&&!state.combat.turnPending&&state.skills.includes(event.target.value)){state.combat.style=event.target.value;save();render();}});
+document.getElementById('app').addEventListener('input',event=>{
+  if(!state?.minigame||storageConflict)return;
+  if(event.target.matches('[data-activity-slider]')){state.minigame.manual=true;state.minigame=activityAction(state.minigame,'position',Number(event.target.value));const needle=document.querySelector('.mg-needle');if(needle)needle.style.left=state.minigame.value+'%';save();}
+});
+document.getElementById('app').addEventListener('change',event=>{if(event.target.matches('[data-activity-count]')){actInActivity('answer',[Number(event.target.dataset.activityCount),Number(event.target.value)]);}});
 document.getElementById('app').addEventListener('submit',event=>{if(event.target.id==='reincarnationNameForm'){event.preventDefault();chooseReincarnationName(document.getElementById('reincarnationName').value);}});
 document.getElementById("modalContent").addEventListener("input",(event)=>{
   const control=event.target.closest("[data-audio]");if(!control)return;
@@ -1256,6 +1295,12 @@ document.addEventListener("keydown",(event)=>{
   if(storageConflict)return;
   if(event.target.closest("input,textarea,select")||!document.getElementById("modalBackdrop").hidden)return;
   if(event.repeat)return;
+  if(state?.minigame){
+    const a=state.minigame,c=activityFor(a.id);
+    if(c.type==='route'&&['ArrowUp','ArrowDown','ArrowLeft','ArrowRight'].includes(event.key)){event.preventDefault();const d={ArrowUp:-5,ArrowDown:5,ArrowLeft:-1,ArrowRight:1};actInActivity('cell',a.position+d[event.key]);}
+    else if(c.type==='timing'&&['Enter',' '].includes(event.key)&&!event.target.closest('button')){event.preventDefault();actInActivity('hit');}
+    return;
+  }
   if(state?.prologueStep!=null&&['Enter',' '].includes(event.key)&&!event.target.closest('button')){event.preventDefault();advancePrologue();return;}
   if(state?.storyMode&&!state.combat&&!state.injury&&['Enter',' '].includes(event.key)&&!event.target.closest('button')){event.preventDefault();advanceStory();return;}
   if(state?.tutorial==='encounter'&&['Enter',' '].includes(event.key)&&!event.target.closest('button')){event.preventDefault();advanceEncounter();return;}
@@ -1268,7 +1313,7 @@ document.addEventListener("keydown",(event)=>{
 
 state=null;
 activeCue=mainBgm;
-document.addEventListener('visibilitychange',()=>{if(document.hidden){stopAllMusic();finishTyping?.();}else if(musicEnabled)startMusic();});
+document.addEventListener('visibilitychange',()=>{document.body.classList.toggle('tab-hidden',document.hidden);if(document.hidden){stopAllMusic();finishTyping?.();}else if(musicEnabled)startMusic();});
 window.addEventListener('storage',(event)=>{if(event.key===SAVE_KEY&&state&&event.newValue!==observedSave){storageConflict=true;showStorageConflict();}});
 document.body.classList.remove('booting');document.querySelector('.topbar').inert=false;
 document.querySelectorAll('[data-icon]').forEach(node=>node.innerHTML=icon(node.dataset.icon));

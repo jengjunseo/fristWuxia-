@@ -10,6 +10,8 @@ import {prologue,sceneIllustrations} from '../prologue.js';
 import {MUSIC} from '../music.js';
 import {icon} from '../icons.js';
 import {journey,currentChapter,legacyStorySteps} from '../journey.js';
+import {activityFor,createActivity,activityAction,renderActivity} from '../minigames.js';
+import {solveActivity} from './activity-helper.mjs';
 
 const source=(await readFile(new URL('../game.js',import.meta.url),'utf8')).replace(/^import .*;\r?\n/gm,'');
 function game() {
@@ -18,7 +20,7 @@ function game() {
   const get=id=>{if(!nodes.has(id))nodes.set(id,node());return nodes.get(id)};
   const audio=()=>({paused:true,volume:0,play(){this.paused=false;return Promise.resolve()},pause(){this.paused=true}});
   Object.assign(get('mainBgm'),audio());
-  const ctx=vm.createContext({...data,normalizeSave,readSave,writeSave,BACKUP_KEY,SLOT_KEY,chapterDialogue,endingLetters,prologue,sceneIllustrations,MUSIC,icon,journey,currentChapter,legacyStorySteps,preloadImage:()=>Promise.resolve(true),URLSearchParams,console,performance,Audio:function(){return audio()},localStorage:{getItem(k){return store.get(k)||null},setItem(k,v){store.set(k,v)}},document:{getElementById:get,querySelector:selector=>selector.includes("[data-typewriter]")?null:get(selector),querySelectorAll(){return []},addEventListener(){},body:node()},window:{matchMedia(){return {matches:false}},addEventListener(){},innerWidth:1600,innerHeight:900,scrollTo(){}},setTimeout(fn){tasks.push(fn);return tasks.length},clearTimeout(){},setInterval(){return 1},clearInterval(){},requestAnimationFrame(){},cancelAnimationFrame(){}});
+  const ctx=vm.createContext({...data,normalizeSave,readSave,writeSave,BACKUP_KEY,SLOT_KEY,chapterDialogue,endingLetters,prologue,sceneIllustrations,MUSIC,icon,journey,currentChapter,legacyStorySteps,activityFor,createActivity,activityAction,renderActivity,solveActivity,structuredClone,preloadImage:()=>Promise.resolve(true),URLSearchParams,console,performance,Audio:function(){return audio()},localStorage:{getItem(k){return store.get(k)||null},setItem(k,v){store.set(k,v)}},document:{getElementById:get,querySelector:selector=>selector.includes("[data-typewriter]")?null:get(selector),querySelectorAll(){return []},addEventListener(){},body:node()},window:{matchMedia(){return {matches:false}},addEventListener(){},innerWidth:1600,innerHeight:900,scrollTo(){}},setTimeout(fn){tasks.push(fn);return tasks.length},clearTimeout(){},setInterval(){return 1},clearInterval(){},requestAnimationFrame(){},cancelAnimationFrame(){}});
   vm.runInContext(source,ctx);
   const run=s=>vm.runInContext(s,ctx);
   run('state=makeInitial("검수");');
@@ -201,7 +203,10 @@ test('the linear journey plays every chapter in order and ends as a beginner',()
   }
   for(let step=0;step<journey.length;step++){
     assert.equal(g.get().storyStep,step);
-    for(let line=0;line<journey[step].lines.length;line++)g.run('inputAfter=0;advanceStory();');
+    for(let line=0;g.get().storyStep===step&&!g.get().combat&&line<30;line++){
+      if(g.get().minigame)g.run('state.minigame=solveActivity(state.minigame);continueActivity();');
+      else g.run('inputAfter=0;advanceStory();');
+    }
     for(let round=0;g.get().combat&&round<8;round++){g.run('combatMove("defend")');g.flush();}
     assert.equal(g.get().injury,null,journey[step].id);
     assert.equal(g.get().storyStep,step+1,journey[step].id);
@@ -210,6 +215,7 @@ test('the linear journey plays every chapter in order and ends as a beginner',()
     assert.equal(saved.storyStep,step+1);
   }
   assert.ok(g.get().flags.journeyComplete);assert.ok(!g.get().flags.titleEarned);
+  assert.equal(g.get().activityCleared.length,22);
   assert.equal(g.get().skills.length,1);assert.ok(g.get().day<30);
   for(const id of ['innkeeper','physician','disciple','guard','mentor'])assert.ok(g.get().trust[id]>0,id);
   assert.match(g.run('renderStory()'),/돌아갈 곳/);
@@ -222,7 +228,7 @@ test('linear dialogue cannot offer exploratory choices or grant repeated chapter
     assert.ok(!/event-card|choice-button|choose-event|opening-choice|event-cg/.test(html),journey[step].id);
     assert.equal((html.match(/class="vn-art"/g)||[]).length,1);
   }
-  g.run('state.storyStep=4;state.dialogueStep=currentChapter(state).lines.length-1;inputAfter=0;advanceStory();advanceStory();');
+  g.run('state.storyStep=4;state.dialogueStep=currentChapter(state).lines.length-1;inputAfter=0;advanceStory();state.minigame=solveActivity(state.minigame);continueActivity();advanceStory();');
   assert.equal(g.get().storyStep,5);assert.equal(g.get().coin,2);assert.equal(g.get().dialogueStep,0);
 });
 test('every linear battle save resumes the current turn and continues only once',()=>{
@@ -268,4 +274,36 @@ test('old battle and injury saves migrate to the correct linear battle chapter',
 test('a story click completes typing before moving to the next line',()=>{
   const g=game();g.run('state.storyMode=true;state.tutorial="free";var finished=0;finishTyping=()=>{finished++;finishTyping=null;};inputAfter=0;advanceStory();');
   assert.equal(g.run('finished'),1);assert.equal(g.get().dialogueStep,0);g.run('inputAfter=0;advanceStory();');assert.equal(g.get().dialogueStep,1);
+});
+test('all daily activities block dialogue until cleared and resume exactly once',()=>{
+  for(const [step,chapter] of journey.entries())if(activityFor(chapter.id)){
+    const g=game();g.run(`state.storyMode=true;state.tutorial="free";state.storyStep=${step};state.dialogueStep=${activityFor(chapter.id).after};inputAfter=0;advanceStory();`);
+    assert.equal(g.get().minigame.id,chapter.id);
+    g.run('continueActivity();inputAfter=0;advanceStory();completeStoryChapter();');
+    assert.equal(g.get().storyStep,step);assert.equal(g.get().dialogueStep,activityFor(chapter.id).after);
+    g.run('state.minigame=solveActivity(state.minigame);');
+    const saved=normalizeSave(g.get(),g.run('makeInitial("검수")'));
+    g.run('resumeGame('+JSON.stringify(saved)+');continueActivity();continueActivity();');
+    assert.equal(g.get().dialogueStep,activityFor(chapter.id).after+1);
+    assert.equal(g.get().activityCleared.filter(id=>id===chapter.id).length,1);
+    assert.equal(g.get().minigame,null);
+  }
+});
+test('old dialogue positions receive the new activity without rewinding the scene',()=>{
+  const g=game();g.run('state.storyMode=true;state.tutorial="free";state.storyStep=0;state.dialogueStep=6;resumeGame(state);inputAfter=0;advanceStory();');
+  assert.equal(g.get().dialogueStep,6);assert.equal(g.get().minigame.id,'first-meal');
+  g.run('state.minigame=solveActivity(state.minigame);continueActivity();');assert.equal(g.get().dialogueStep,7);
+});
+test('partly played boards of every type round-trip through story saves and corrupt boards are rejected',()=>{
+  const acts={timing:['hit',50],memory:['card',0],sequence:['begin'],pay:['coin',0],count:['tally',0],sort:['token',0],route:['cell',5]};
+  for(const [step,chapter] of journey.entries())if(activityFor(chapter.id)){
+    const g=game();g.run(`state.storyMode=true;state.tutorial="free";state.storyStep=${step};state.dialogueStep=${activityFor(chapter.id).after};state.minigame=createActivity("${chapter.id}");`);
+    const type=g.get().minigame.type,[task,value]=acts[type];g.run('state.minigame=activityAction(state.minigame,'+JSON.stringify(task)+','+JSON.stringify(value)+');');
+    const saved=normalizeSave(g.get(),g.run('makeInitial("검수")'));g.run('resumeGame('+JSON.stringify(saved)+');');
+    assert.deepEqual(g.get().minigame,saved.minigame,chapter.id);
+    assert.throws(()=>normalizeSave({...saved,minigame:{...saved.minigame,cleared:true}},g.run('makeInitial("검수")')));
+    assert.throws(()=>normalizeSave({...saved,prologueStep:0},g.run('makeInitial("검수")')));
+    assert.throws(()=>normalizeSave({...saved,activityCleared:[chapter.id]},g.run('makeInitial("검수")')));
+    assert.throws(()=>normalizeSave({...saved,activityCleared:['__proto__']},g.run('makeInitial("검수")')));
+  }
 });
