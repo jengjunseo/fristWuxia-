@@ -3,11 +3,11 @@ import { readFile, stat } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
-const root = path.dirname(fileURLToPath(import.meta.url));
-const port = Number(process.env.PORT || 4173);
+const root = process.env.SERVE_DIST === '1' ? path.join(path.dirname(fileURLToPath(import.meta.url)), 'dist') : path.dirname(fileURLToPath(import.meta.url));
+const port = Number(process.env.PORT || 4190);
 const mime = {
   ".html":"text/html; charset=utf-8", ".css":"text/css; charset=utf-8", ".js":"text/javascript; charset=utf-8",
-  ".mjs":"text/javascript; charset=utf-8", ".json":"application/json; charset=utf-8", ".png":"image/png", ".webp":"image/webp", ".svg":"image/svg+xml", ".ogg":"audio/ogg", ".mp3":"audio/mpeg"
+  ".mjs":"text/javascript; charset=utf-8", ".json":"application/json; charset=utf-8", ".png":"image/png", ".webp":"image/webp", ".svg":"image/svg+xml", ".ogg":"audio/ogg", ".mp3":"audio/mpeg", ".ttf":"font/ttf", ".woff2":"font/woff2"
 };
 
 const server = http.createServer(async (req, res) => {
@@ -32,7 +32,7 @@ const server = http.createServer(async (req, res) => {
       "Cache-Control":"no-cache",
       "X-Content-Type-Options":"nosniff",
       "Referrer-Policy":"no-referrer",
-      "Content-Security-Policy":"default-src 'self'; img-src 'self' data:; script-src 'self'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com; connect-src 'self'; object-src 'none'; base-uri 'self'; frame-ancestors 'self'"
+      "Content-Security-Policy":"default-src 'self'; img-src 'self' data:; script-src 'self'; style-src 'self' 'unsafe-inline'; font-src 'self'; media-src 'self'; connect-src 'self'; object-src 'none'; base-uri 'self'; frame-ancestors 'self'"
     });
     res.end(req.method === "HEAD" ? undefined : data);
   } catch {
@@ -41,6 +41,7 @@ const server = http.createServer(async (req, res) => {
   }
 });
 
+server.on('error',error=>{console.error(error.code==='EADDRINUSE'?`포트 ${port}가 사용 중입니다. PORT 환경변수로 다른 포트를 지정해 주세요.`:'게임 서버를 시작하지 못했습니다: '+error.message);process.exitCode=1;});
 server.listen(port, "127.0.0.1", () => {
   console.log(`강호 첫걸음 실행 중: http://127.0.0.1:${port}/`);
 });
